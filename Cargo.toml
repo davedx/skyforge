@@ -1,0 +1,33 @@
+[package]
+name = "skyforge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "A native, text-first workspace for coding agents"
+license = "MIT"
+
+[dependencies]
+base64 = "0.23"
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "accesskit"] }
+egui_commonmark = "0.20"
+egui_extras = { version = "0.31.1", features = ["syntect", "image", "file"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+dirs = "6"
+rfd = "0.15"
+ignore = "0.4"
+pulldown-cmark = "0.13"
+libc = "0.2"
+linkify = "0.10"
+regex-automata = { version = "0.4", default-features = false, features = ["std", "meta", "unicode"] }
+url = "2"
+notify = "8.2.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
