@@ -82,6 +82,38 @@ pub fn selected_config(config: &Config, selection: &str) -> Config {
     config.model = config.model.trim().into();
     config
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplay {
+    #[default]
+    Auto,
+    Omit,
+    CurrentTurn,
+    PreserveHistory,
+}
+
+impl ReasoningReplay {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Omit => "Omit",
+            Self::CurrentTurn => "Current turn",
+            Self::PreserveHistory => "Preserve history",
+        }
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct ModelCapabilities {
+    pub max_output_tokens: Option<usize>,
+    pub reasoning: Option<bool>,
+}
+
+pub struct ModelCatalog {
+    pub ids: Vec<String>,
+    pub capabilities: std::collections::BTreeMap<String, ModelCapabilities>,
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Config {
     pub host: String,
@@ -90,12 +122,132 @@ pub struct Config {
     /// Context windows in tokens, keyed by exact served model ID.
     #[serde(default)]
     pub context_windows: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub output_limits: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub model_capabilities: std::collections::BTreeMap<String, ModelCapabilities>,
+    /// Overrides keyed by normalized host URL and exact served model ID.
+    #[serde(default)]
+    pub reasoning_replay: std::collections::BTreeMap<String, ReasoningReplay>,
     #[serde(skip)]
     pub history_dir: PathBuf,
     #[serde(skip)]
     pub available_models: Vec<String>,
     #[serde(skip)]
     pub retry: bool,
+}
+
+impl Config {
+    pub fn replay_key(&self) -> String {
+        self.model_key(&self.model)
+    }
+
+    fn model_key(&self, model: &str) -> String {
+        let host = url::Url::parse(self.host.trim())
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| self.host.trim().to_owned());
+        format!("{}|{}", host.trim_end_matches('/'), model.trim())
+    }
+
+    pub fn replay_policy(&self) -> ReasoningReplay {
+        let policy = self
+            .reasoning_replay
+            .get(&self.replay_key())
+            .copied()
+            .unwrap_or_default();
+        if policy != ReasoningReplay::Auto {
+            return policy;
+        }
+        let model = self.model.to_lowercase();
+        let host = url::Url::parse(self.host.trim()).ok();
+        let host = host.as_ref().and_then(|url| url.host_str()).unwrap_or("");
+        if host == "api.deepseek.com"
+            || host == "api.mistral.ai"
+            || model.contains("deepseek")
+            || model.contains("magistral")
+            || ["qwen3.6", "qwen3.7", "qwen3.8"]
+                .iter()
+                .any(|name| model.contains(name))
+        {
+            ReasoningReplay::PreserveHistory
+        } else if model.contains("qwen3") {
+            ReasoningReplay::CurrentTurn
+        } else {
+            ReasoningReplay::Omit
+        }
+    }
+
+    pub fn context_window(&self) -> usize {
+        self.context_windows
+            .get(&self.model)
+            .copied()
+            .unwrap_or(32_768)
+            .clamp(8192, 2_000_000)
+    }
+
+    pub fn output_limit(&self) -> usize {
+        let capabilities = self.model_capabilities.get(&self.replay_key());
+        let supported = capabilities
+            .and_then(|c| c.max_output_tokens)
+            .filter(|limit| *limit > 0);
+        let requested = self
+            .output_limits
+            .get(&self.model)
+            .copied()
+            .unwrap_or_else(|| {
+                let model = self.model.to_lowercase();
+                let reasoning = capabilities.and_then(|c| c.reasoning).unwrap_or_else(|| {
+                    self.replay_policy() != ReasoningReplay::Omit
+                        || model.contains("reason")
+                        || model.contains("thinking")
+                        || model.contains("gpt-oss")
+                });
+                // Automatic budgets leave substantial input room even on small local windows.
+                supported
+                    .unwrap_or(if reasoning { 32_768 } else { 16_384 })
+                    .min(self.context_window() / 2)
+            });
+        requested
+            .min(supported.unwrap_or(usize::MAX))
+            .clamp(1, self.context_window().saturating_sub(512 + 1024))
+    }
+
+    pub fn apply_catalog(&mut self, catalog: ModelCatalog) {
+        let prefix = self.model_key("");
+        self.model_capabilities
+            .retain(|key, _| !key.starts_with(&prefix));
+        for (model, capabilities) in catalog.capabilities {
+            self.model_capabilities
+                .insert(self.model_key(&model), capabilities);
+        }
+        self.available_models = catalog.ids;
+    }
+}
+
+fn completion_payload(config: &Config, messages: Vec<Value>, tools: &[Value]) -> Value {
+    let mut payload = json!({"model":config.model,"messages":messages,"tools":tools,"tool_choice":"auto","stream":false,"max_tokens":config.output_limit()});
+    let model = config.model.to_lowercase();
+    let policy = config.replay_policy();
+    let url = url::Url::parse(config.host.trim()).ok();
+    let host = url.as_ref().and_then(|url| url.host_str()).unwrap_or("");
+    if ["qwen3.6", "qwen3.7", "qwen3.8"]
+        .iter()
+        .any(|name| model.contains(name))
+    {
+        let preserve = policy == ReasoningReplay::PreserveHistory;
+        if host == "dashscope.aliyuncs.com"
+            || host.ends_with(".aliyuncs.com")
+            || host.ends_with(".qwencloud.com")
+        {
+            payload["preserve_thinking"] = json!(preserve);
+        } else {
+            payload["chat_template_kwargs"] = json!({"preserve_thinking":preserve});
+        }
+    }
+    if host == "api.deepseek.com" && policy == ReasoningReplay::Omit {
+        payload["thinking"] = json!({"type":"disabled"});
+    }
+    payload
 }
 
 pub fn load(store: &crate::store::Store, project: &Path) -> Config {
@@ -111,6 +263,9 @@ pub fn load(store: &crate::store::Store, project: &Path) -> Config {
                     "local_context_windows",
                     serde_json::to_string(&seed.context_windows).unwrap_or_default(),
                 ),
+                ("local_output_limits", serde_json::to_string(&seed.output_limits).unwrap_or_default()),
+                ("local_model_capabilities", serde_json::to_string(&seed.model_capabilities).unwrap_or_default()),
+                ("local_reasoning_replay", serde_json::to_string(&seed.reasoning_replay).unwrap_or_default()),
             ]
             .iter()
             .all(|(k, v)| store.set_setting(k, v).is_ok());
@@ -131,6 +286,9 @@ pub fn load(store: &crate::store::Store, project: &Path) -> Config {
             .setting("local_context_windows")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default(),
+        output_limits: store.setting("local_output_limits").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+        model_capabilities: store.setting("local_model_capabilities").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+        reasoning_replay: store.setting("local_reasoning_replay").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
         history_dir: store.path.with_file_name("local-sessions"),
         available_models: vec![],
         retry: false,
@@ -349,18 +507,21 @@ fn run(
         });
         let response = request(
             &config.local,
-            &json!({"model":config.local.model,"messages":request_messages,"tools":definitions,"tool_choice":"auto","stream":false,"max_tokens":65536}),
+            &completion_payload(&config.local, request_messages, &definitions),
             stop,
             emit,
         )?;
         if let Some(error) = response.get("error") {
+            emit_prompt_usage(&response, "", emit);
             return Err(server_error(&config.local, error));
         }
-        let choice = response["choices"]
-            .get(0)
-            .ok_or("Local server returned no choices.")?;
+        let Some(choice) = response["choices"].get(0) else {
+            emit_prompt_usage(&response, "", emit);
+            return Err("Local server returned no choices.".into());
+        };
         let raw_message = &choice["message"];
         if choice["finish_reason"] == "length" {
+            emit_prompt_usage(&response, "", emit);
             return Err("Local model reached its response limit. Shorten the request or use a model with a larger output limit.".into());
         }
         let message = match normalize_with_tools(raw_message, &definitions) {
@@ -371,6 +532,7 @@ fn run(
                     role: "Diagnostics".into(),
                     body: format!("Could not process the local model response: {error}"),
                 });
+                emit_prompt_usage(&response, "", emit);
                 if repair_attempts >= 2 {
                     return Err(format!("Could not recover the local response after two correction requests: {error}; no tool from this response was executed. Use Retry request."));
                 }
@@ -401,6 +563,7 @@ fn run(
                 body: body.into(),
             });
         }
+        emit_prompt_usage(&response, "", emit);
         messages.push(message.clone());
         save_history(history_path, &messages)?;
         if calls.is_empty() {
@@ -650,6 +813,10 @@ fn normalize_with_tools(raw: &Value, definitions: &[Value]) -> Result<Value, Str
         Some(Value::Array(parts)) => {
             let mut text = String::new();
             for part in parts {
+                if part["type"] == "thinking" {
+                    message["_skyforge_content"] = raw["content"].clone();
+                    continue;
+                }
                 if part["type"] != "text" {
                     return Err("Unsupported content block".into());
                 }
@@ -660,9 +827,12 @@ fn normalize_with_tools(raw: &Value, definitions: &[Value]) -> Result<Value, Str
         Some(_) => return Err("Invalid assistant content".into()),
     };
     if let Some(thought) = body.trim_start().strip_prefix("<think>") {
-        let (_, answer) = thought
+        let (reasoning, answer) = thought
             .split_once("</think>")
             .ok_or("Unclosed reasoning block")?;
+        if message.get("reasoning_content").is_none_or(Value::is_null) {
+            message["reasoning_content"] = json!(reasoning);
+        }
         body = answer.trim().into();
     }
     // Recover Harmony text without ever discarding a tool recipient. Structured
@@ -1137,7 +1307,7 @@ pub(crate) fn tool(
     }
 }
 
-pub fn discover_models(config: &Config) -> Result<Vec<String>, String> {
+pub fn discover_models(config: &Config) -> Result<ModelCatalog, String> {
     let url = endpoint(&config.host)?.replace("/chat/completions", "/models");
     if config.api_key.contains(['\n', '\r']) {
         return Err("API key must be a single line.".into());
@@ -1155,17 +1325,71 @@ pub fn discover_models(config: &Config) -> Result<Vec<String>, String> {
         .as_array()
         .ok_or("Local server returned no model list.")?;
     let mut models = Vec::new();
+    let mut capabilities = std::collections::BTreeMap::new();
     for model in data {
         if let Some(id) = model["id"].as_str().filter(|id| !id.trim().is_empty()) {
             if !models.iter().any(|m| m == id) {
                 models.push(id.to_owned());
+            }
+            let max_output_tokens = [
+                &model["max_output_tokens"],
+                &model["max_completion_tokens"],
+                &model["limits"]["output"],
+                &model["top_provider"]["max_completion_tokens"],
+            ]
+            .into_iter()
+            .filter_map(Value::as_u64)
+            .filter_map(|limit| usize::try_from(limit).ok())
+            .find(|limit| *limit > 0);
+            let reasoning = model["reasoning"]
+                .as_bool()
+                .or_else(|| model["capabilities"]["reasoning"].as_bool());
+            if max_output_tokens.is_some() || reasoning.is_some() {
+                capabilities.insert(
+                    id.to_owned(),
+                    ModelCapabilities {
+                        max_output_tokens,
+                        reasoning,
+                    },
+                );
             }
         }
     }
     if models.is_empty() {
         return Err("Local server advertises no models.".into());
     }
-    Ok(models)
+    Ok(ModelCatalog {
+        ids: models,
+        capabilities,
+    })
+}
+
+fn emit_prompt_usage(response: &Value, label: &str, emit: &impl Fn(Event)) {
+    let usage = &response["usage"];
+    let hit = usage["prompt_cache_hit_tokens"]
+        .as_u64()
+        .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .or_else(|| usage["input_tokens_details"]["cached_tokens"].as_u64());
+    let miss = usage["prompt_cache_miss_tokens"].as_u64().or_else(|| {
+        usage["prompt_tokens"]
+            .as_u64()
+            .or_else(|| usage["input_tokens"].as_u64())?
+            .checked_sub(hit?)
+    });
+    let display = |count: Option<u64>| {
+        count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unavailable".into())
+    };
+    emit(Event::Message {
+        item: uuid::Uuid::new_v4().to_string(),
+        role: "Usage".into(),
+        body: format!(
+            "{label}Prompt cache hit: {} tokens · Prompt cache miss: {} tokens",
+            display(hit),
+            display(miss)
+        ),
+    });
 }
 
 fn request(
@@ -1728,6 +1952,337 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_replays_after_tools_and_resume_without_reaching_ui() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        std::fs::write(root.join("README.md"), "contents").unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = config(&root, format!("http://{}", server.local_addr().unwrap()));
+        cfg.local.model = "deepseek-fixture".into();
+        cfg.local
+            .output_limits
+            .insert(cfg.local.model.clone(), 8192);
+        let fixture = thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            let first = receive(&mut socket);
+            assert_eq!(first["max_tokens"], 8192);
+            respond(
+                &mut socket,
+                json!({"role":"assistant","content":"","reasoning_content":"private tool reasoning","tool_calls":[{"id":"read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]}),
+            );
+            let (mut socket, _) = server.accept().unwrap();
+            let second = receive(&mut socket);
+            assert_eq!(
+                second["messages"][2]["reasoning_content"],
+                "private tool reasoning"
+            );
+            assert_eq!(second["messages"][2]["content"], "");
+            assert_eq!(second["messages"][3]["tool_call_id"], "read");
+            respond(
+                &mut socket,
+                json!({"role":"assistant","content":"<think>private final reasoning</think>Done."}),
+            );
+            let (mut socket, _) = server.accept().unwrap();
+            let third = receive(&mut socket);
+            assert_eq!(
+                third["messages"][2]["reasoning_content"],
+                "private tool reasoning"
+            );
+            assert_eq!(
+                third["messages"][4]["reasoning_content"],
+                "private final reasoning"
+            );
+            assert_eq!(third["messages"][4]["content"], "Done.");
+            respond(
+                &mut socket,
+                json!({"role":"assistant","content":"Confirmed."}),
+            );
+        });
+        let mut w = Workstream::new(&root);
+        w.draft = "Read README.md".into();
+        let history_path = root.join("history.json");
+        let events = std::cell::RefCell::new(Vec::new());
+        for draft in ["Read README.md", "Confirm"] {
+            w.draft = draft.into();
+            run(
+                &cfg,
+                &w,
+                &root,
+                &history_path,
+                None,
+                &AtomicBool::new(false),
+                &|event| events.borrow_mut().push(event),
+            )
+            .unwrap();
+        }
+        fixture.join().unwrap();
+        assert!(std::fs::read_to_string(history_path)
+            .unwrap()
+            .contains("private final reasoning"));
+        for event in events.into_inner() {
+            if let Event::Message { body, .. } = event {
+                assert!(!body.contains("private tool reasoning"));
+                assert!(!body.contains("private final reasoning"));
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_output_defaults_follow_capabilities_and_preserve_overrides() {
+        let mut cfg = Config {
+            model: "plain-model".into(),
+            host: "http://localhost:8000/v1".into(),
+            ..Default::default()
+        };
+        cfg.context_windows.insert(cfg.model.clone(), 131_072);
+        assert_eq!(cfg.output_limit(), 16_384);
+        cfg.model = "Qwen/Qwen3.8-27B".into();
+        cfg.context_windows.insert(cfg.model.clone(), 131_072);
+        assert_eq!(cfg.output_limit(), 32_768);
+        cfg.model_capabilities.insert(
+            cfg.replay_key(),
+            ModelCapabilities {
+                max_output_tokens: Some(65_536),
+                reasoning: Some(true),
+            },
+        );
+        assert_eq!(cfg.output_limit(), 65_536);
+        cfg.output_limits.insert(cfg.model.clone(), 8192);
+        assert_eq!(cfg.output_limit(), 8192);
+        cfg.model_capabilities
+            .get_mut(&cfg.replay_key())
+            .unwrap()
+            .max_output_tokens = Some(4096);
+        assert_eq!(cfg.output_limit(), 4096);
+        cfg.output_limits.clear();
+        cfg.model_capabilities
+            .get_mut(&cfg.replay_key())
+            .unwrap()
+            .max_output_tokens = None;
+        cfg.model_capabilities
+            .get_mut(&cfg.replay_key())
+            .unwrap()
+            .reasoning = Some(false);
+        assert_eq!(cfg.output_limit(), 16_384);
+        cfg.context_windows.insert(cfg.model.clone(), 8192);
+        assert_eq!(cfg.output_limit(), 4096);
+        cfg.host = "http://other-server/v1".into();
+        cfg.context_windows.insert(cfg.model.clone(), 131_072);
+        assert_eq!(cfg.output_limit(), 32_768);
+    }
+
+    #[test]
+    fn replay_defaults_overrides_and_output_limits_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let store = crate::store::Store::open(temp.0.join("history.sqlite3")).unwrap();
+        let mut cfg = Config::default();
+        for (host, model, expected) in [
+            (
+                "https://api.deepseek.com/v1",
+                "alias",
+                ReasoningReplay::PreserveHistory,
+            ),
+            (
+                "http://localhost:8000/v1",
+                "Qwen/Qwen3-8B",
+                ReasoningReplay::CurrentTurn,
+            ),
+            (
+                "http://localhost:8000/v1",
+                "Qwen/Qwen3.8-27B",
+                ReasoningReplay::PreserveHistory,
+            ),
+            ("http://localhost:8000/v1", "unknown", ReasoningReplay::Omit),
+        ] {
+            cfg.host = host.into();
+            cfg.model = model.into();
+            assert_eq!(cfg.replay_policy(), expected);
+        }
+        cfg.reasoning_replay
+            .insert(cfg.replay_key(), ReasoningReplay::PreserveHistory);
+        cfg.context_windows.insert(cfg.model.clone(), 8192);
+        cfg.output_limits.insert(cfg.model.clone(), 65536);
+        cfg.model_capabilities.insert(
+            cfg.replay_key(),
+            ModelCapabilities {
+                max_output_tokens: Some(65_536),
+                reasoning: Some(true),
+            },
+        );
+        assert_eq!(cfg.output_limit(), 6656);
+        store.set_setting("local_host", &cfg.host).unwrap();
+        store.set_setting("local_model", &cfg.model).unwrap();
+        store
+            .set_setting(
+                "local_context_windows",
+                &serde_json::to_string(&cfg.context_windows).unwrap(),
+            )
+            .unwrap();
+        store
+            .set_setting(
+                "local_output_limits",
+                &serde_json::to_string(&cfg.output_limits).unwrap(),
+            )
+            .unwrap();
+        store
+            .set_setting(
+                "local_model_capabilities",
+                &serde_json::to_string(&cfg.model_capabilities).unwrap(),
+            )
+            .unwrap();
+        store
+            .set_setting(
+                "local_reasoning_replay",
+                &serde_json::to_string(&cfg.reasoning_replay).unwrap(),
+            )
+            .unwrap();
+        let mut restored = load(&store, &temp.0);
+        assert_eq!(restored.replay_policy(), ReasoningReplay::PreserveHistory);
+        assert_eq!(restored.output_limit(), 6656);
+        assert_eq!(
+            restored.model_capabilities[&restored.replay_key()].max_output_tokens,
+            Some(65_536)
+        );
+        restored.host = "http://other-server/v1".into();
+        assert_eq!(restored.replay_policy(), ReasoningReplay::Omit);
+        assert_eq!(Config::default().output_limit(), 16_384);
+    }
+
+    #[test]
+    fn provider_payloads_use_their_reasoning_controls() {
+        let mut cfg = Config {
+            model: "Qwen/Qwen3.8-27B".into(),
+            host: "http://localhost:8000/v1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_payload(&cfg, vec![], &[])["chat_template_kwargs"]["preserve_thinking"],
+            true
+        );
+        cfg.host = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into();
+        assert_eq!(
+            completion_payload(&cfg, vec![], &[])["preserve_thinking"],
+            true
+        );
+        cfg.host = "https://api.deepseek.com/v1".into();
+        cfg.model = "deepseek-flash".into();
+        cfg.reasoning_replay
+            .insert(cfg.replay_key(), ReasoningReplay::Omit);
+        assert_eq!(
+            completion_payload(&cfg, vec![], &[])["thinking"]["type"],
+            "disabled"
+        );
+    }
+
+    #[test]
+    fn mistral_thinking_chunks_are_saved_separately_from_visible_text() {
+        let raw = json!({"role":"assistant","content":[{"type":"thinking","thinking":[{"type":"text","text":"private thought"}]},{"type":"text","text":"Visible answer"}]});
+        let normalized = normalize_with_tools(&raw, &[]).unwrap();
+        assert_eq!(normalized["content"], "Visible answer");
+        assert_eq!(normalized["_skyforge_content"], raw["content"]);
+        let cfg = Config {
+            model: "magistral-small".into(),
+            ..Default::default()
+        };
+        let projected = compaction::Compactor::default()
+            .prepare(&cfg, &[normalized], &[], &AtomicBool::new(false), &|_| {})
+            .unwrap();
+        assert_eq!(projected[0]["content"], raw["content"]);
+        assert!(projected[0].get("_skyforge_content").is_none());
+    }
+
+    #[test]
+    fn direct_responses_emit_cache_usage_after_text_without_polluting_history() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        std::fs::write(root.join("README.md"), "file contents").unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = config(&root, format!("http://{}", server.local_addr().unwrap()));
+        let fixture = thread::spawn(move || {
+            let responses = [
+                json!({"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]}}],"usage":{"prompt_cache_hit_tokens":100,"prompt_cache_miss_tokens":25}}),
+                json!({"choices":[{"message":{"role":"assistant","content":"Done."}}],"usage":{"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":150}}}),
+            ];
+            for response in responses {
+                let (mut socket, _) = server.accept().unwrap();
+                let request = receive(&mut socket);
+                assert!(!request.to_string().contains("Prompt cache hit"));
+                let body = response.to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut w = Workstream::new(&root);
+        w.draft = "Read README.md".into();
+        let history_path = root.join("history.json");
+        let events = std::cell::RefCell::new(Vec::new());
+        run(
+            &cfg,
+            &w,
+            &root,
+            &history_path,
+            None,
+            &AtomicBool::new(false),
+            &|event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+        fixture.join().unwrap();
+        let events = events.into_inner();
+        let messages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Message { role, body, .. } => Some((role.as_str(), body.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages.iter().map(|(role, _)| *role).collect::<Vec<_>>(),
+            ["Usage", "Tool", "Agent", "Usage"]
+        );
+        assert_eq!(
+            messages[0].1,
+            "Prompt cache hit: 100 tokens · Prompt cache miss: 25 tokens"
+        );
+        assert_eq!(
+            messages[3].1,
+            "Prompt cache hit: 150 tokens · Prompt cache miss: 50 tokens"
+        );
+        assert!(!std::fs::read_to_string(history_path)
+            .unwrap()
+            .contains("Prompt cache hit"));
+    }
+
+    #[test]
+    fn cache_usage_does_not_invent_counts_when_provider_omits_them() {
+        for (response, expected) in [
+            (
+                json!({"usage":{"prompt_tokens":200}}),
+                "Prompt cache hit: unavailable tokens · Prompt cache miss: unavailable tokens",
+            ),
+            (
+                json!({"usage":{"input_tokens":200,"input_tokens_details":{"cached_tokens":0}}}),
+                "Prompt cache hit: 0 tokens · Prompt cache miss: 200 tokens",
+            ),
+            (
+                json!({"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":200}}}),
+                "Prompt cache hit: 200 tokens · Prompt cache miss: unavailable tokens",
+            ),
+        ] {
+            emit_prompt_usage(&response, "", &|event| {
+                let Event::Message { role, body, .. } = event else {
+                    panic!("Expected usage")
+                };
+                assert_eq!(role, "Usage");
+                assert_eq!(body, expected);
+            });
+        }
+    }
+
+    #[test]
     fn local_http_logs_preserve_wire_json_without_ui_messages() {
         let temp = TempDir::new().unwrap();
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2202,6 +2757,9 @@ mod tests {
                 api_key: "fixture-key".into(),
                 model: "fixture-qwen".into(),
                 context_windows: Default::default(),
+                output_limits: Default::default(),
+                model_capabilities: Default::default(),
+                reasoning_replay: Default::default(),
                 history_dir: root.join("sessions"),
                 available_models: vec![],
                 retry: false,
@@ -2724,15 +3282,18 @@ mod tests {
                     break;
                 }
             }
-            let body = json!({"data":[{"id":"gemma-4-26b-qat-4bit"},{"id":"gpt-oss-20b"},{"id":"gpt-oss-20b"}]}).to_string();
+            let body = json!({"data":[{"id":"gemma-4-26b-qat-4bit"},{"id":"gpt-oss-20b","max_output_tokens":6000,"capabilities":{"reasoning":true}},{"id":"gpt-oss-20b"}]}).to_string();
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             let (mut socket, _) = server.accept().unwrap();
             let payload = receive(&mut socket);
             assert_eq!(payload["model"], "gpt-oss-20b");
+            assert_eq!(payload["max_tokens"], 6000);
             respond(&mut socket, json!({"role":"assistant","content":"OK"}));
         });
         let mut cfg = cfg;
-        cfg.local.available_models = discover_models(&cfg.local).unwrap();
+        let catalog = discover_models(&cfg.local).unwrap();
+        cfg.local.apply_catalog(catalog);
+        assert_eq!(selected_config(&cfg.local, &selection_id("gpt-oss-20b")).output_limit(), 6000);
         assert_eq!(
             cfg.local.available_models,
             vec!["gemma-4-26b-qat-4bit", "gpt-oss-20b"]

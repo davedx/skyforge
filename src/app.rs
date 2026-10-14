@@ -85,7 +85,7 @@ pub struct Skyforge {
     settings_open: bool,
     config: AgentConfig,
     model_choices: Vec<(String, String)>,
-    model_discovery: Option<Receiver<Result<Vec<String>, String>>>,
+    model_discovery: Option<Receiver<Result<crate::local::ModelCatalog, String>>>,
     model_discovery_due: Option<Instant>,
     model_discovery_status: String,
     draft_changed: Option<Instant>,
@@ -2285,7 +2285,7 @@ impl Skyforge {
                         .corner_radius(8)
                         .inner_margin(egui::Margin::symmetric(14, 6))
                         .show(ui, |ui| {
-                            if !activity_output(message) {
+                            if !activity_output(message) && message.role != "Usage" {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     RichText::new(message.role.to_uppercase())
@@ -2299,7 +2299,9 @@ impl Skyforge {
                             });
                             ui.add_space(2.0);
                             }
-                            if activity_output(message) {
+                            if message.role == "Usage" {
+                                ui.label(RichText::new(&message.body).small().color(MUTED));
+                            } else if activity_output(message) {
                                 let body = if message.role == "Files" {
                                     message.body.strip_prefix("File changes\n").unwrap_or(&message.body)
                                 } else { &message.body };
@@ -2430,7 +2432,7 @@ impl Skyforge {
         });
     }
 
-    fn settings_values(&self) -> [(&'static str, String); 8] {
+    fn settings_values(&self) -> [(&'static str, String); 11] {
         [
             ("codex_binary", self.config.binary.clone()),
             ("claude_binary", self.config.claude_binary.clone()),
@@ -2441,6 +2443,9 @@ impl Skyforge {
                 "local_context_windows",
                 serde_json::to_string(&self.config.local.context_windows).unwrap_or_default(),
             ),
+            ("local_output_limits", serde_json::to_string(&self.config.local.output_limits).unwrap_or_default()),
+            ("local_model_capabilities", serde_json::to_string(&self.config.local.model_capabilities).unwrap_or_default()),
+            ("local_reasoning_replay", serde_json::to_string(&self.config.local.reasoning_replay).unwrap_or_default()),
             ("web_search", self.config.search.to_string()),
             ("writable", self.config.writable.to_string()),
         ]
@@ -2711,12 +2716,39 @@ impl Skyforge {
                 }
                 if !self.config.local.model.trim().is_empty() {
                     let model = self.config.local.model.trim().to_owned();
-                    let window = self.config.local.context_windows.entry(model).or_insert(32_768);
+                    let window = self.config.local.context_windows.entry(model.clone()).or_insert(32_768);
                     ui.horizontal(|ui| {
                         ui.label("Context size (tokens)");
                         ui.add(egui::DragValue::new(window).range(8_192..=2_000_000).speed(1024));
                     });
                     ui.label(RichText::new("Set this to the server's configured context window. Older history is compacted automatically near the limit.").color(MUTED));
+                    let maximum = window.saturating_sub(512 + 1024);
+                    let mut automatic = !self.config.local.output_limits.contains_key(&model);
+                    if ui.checkbox(&mut automatic, "Use automatic output limit").changed() {
+                        if automatic {
+                            self.config.local.output_limits.remove(&model);
+                        } else {
+                            let output = self.config.local.output_limit();
+                            self.config.local.output_limits.insert(model.clone(), output);
+                        }
+                    }
+                    let mut output = self.config.local.output_limits.get(&model).copied().unwrap_or_else(|| self.config.local.output_limit()).clamp(1, maximum);
+                    ui.horizontal(|ui| {
+                        ui.label("Maximum output (tokens)");
+                        if ui.add_enabled(!automatic, egui::DragValue::new(&mut output).range(1..=maximum).speed(256)).changed() {
+                            self.config.local.output_limits.insert(model.clone(), output);
+                        }
+                    });
+                    ui.label(RichText::new(format!("Effective output limit: {} tokens. The same space is reserved for each answer, including thinking where the server counts it as output.", self.config.local.output_limit())).color(MUTED));
+                    let resolved = self.config.local.replay_policy();
+                    let key = self.config.local.replay_key();
+                    let policy = self.config.local.reasoning_replay.entry(key).or_default();
+                    egui::ComboBox::from_id_salt("local_reasoning_replay").selected_text(format!("Reasoning replay: {}", policy.label())).show_ui(ui, |ui| {
+                        for choice in [crate::local::ReasoningReplay::Auto, crate::local::ReasoningReplay::Omit, crate::local::ReasoningReplay::CurrentTurn, crate::local::ReasoningReplay::PreserveHistory] {
+                            ui.selectable_value(policy, choice, choice.label());
+                        }
+                    });
+                    ui.label(RichText::new(format!("Effective policy: {}. Reasoning stays hidden. Overrides apply to this host and model.", resolved.label())).color(MUTED));
                 }
                 ui.separator();
                 ui.checkbox(&mut self.config.search,"Enable live web research");
@@ -2866,10 +2898,11 @@ impl eframe::App for Skyforge {
         {
             self.model_discovery = None;
             match result {
-                Ok(models) => {
+                Ok(catalog) => {
                     self.model_discovery_status =
-                        format!("{} server models available in the composer.", models.len());
-                    self.config.local.available_models = models;
+                        format!("{} server models available in the composer.", catalog.ids.len());
+                    self.config.local.apply_catalog(catalog);
+                    self.persist_settings();
                     self.model_choices = runner::model_choices(&self.config.local);
                 }
                 Err(error) => self.model_discovery_status = error,
