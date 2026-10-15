@@ -138,6 +138,15 @@ pub struct Config {
 }
 
 impl Config {
+    fn is_deepseek(&self) -> bool {
+        self.model.to_lowercase().contains("deepseek")
+            || url::Url::parse(self.host.trim())
+                .ok()
+                .as_ref()
+                .and_then(|url| url.host_str())
+                == Some("api.deepseek.com")
+    }
+
     pub fn replay_key(&self) -> String {
         self.model_key(&self.model)
     }
@@ -428,7 +437,9 @@ fn run(
         }
     }
     recover_tools(&mut messages);
-    let system = if w.mode == crate::store::Mode::Thinker {
+    let system = if config.local.is_deepseek() {
+        json!({"role":"system","content":"You are a helpful software engineer assistant."})
+    } else if w.mode == crate::store::Mode::Thinker {
         json!({"role":"system","content":crate::thinker::instructions()})
     } else {
         json!({"role":"system","content":format!(
@@ -487,15 +498,16 @@ fn run(
     }
     save_history(history_path, &messages)?;
     let mut compactor = compaction::Compactor::default();
+    let run_id = uuid::Uuid::new_v4().to_string();
     let mut repair_attempts = 0;
-    let mut definitions = tools(writable, restart.is_some());
+    let mut definitions = tools(writable, restart.is_some() && !config.local.is_deepseek());
     if w.mode == crate::store::Mode::Thinker {
         definitions.extend(crate::thinker::tool_definitions().into_iter().map(|tool| json!({"type":"function","function":{"name":tool["name"],"description":tool["description"],"parameters":tool["inputSchema"]}})));
         if config.search {
             definitions.extend(crate::research::definitions());
         }
     }
-    for _ in 0..64 {
+    for step in 0..64 {
         if stop.load(Ordering::SeqCst) {
             return Err("Stopped".into());
         }
@@ -505,28 +517,49 @@ fn run(
             id: "local-request".into(),
             body: format!("Waiting for {}…", config.local.model),
         });
-        let response = request(
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let telemetry = ToolTelemetry {
+            config: &config.local,
+            context: json!({"schema_version":1,"model":config.local.model,"endpoint":endpoint(&config.local.host)?,"run_id":run_id,"request_id":request_id,"workstream_id":w.id,"session_id":history_path.file_stem().and_then(|s| s.to_str()),"mode":w.mode,"step":step + 1}),
+            error: Mutex::new(None),
+        };
+        let record_response = |message: &Value, status: &str, error: Option<&str>| {
+            let calls: Vec<_> = message["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|call| json!({"id":call["id"],"name":call["function"]["name"]}))
+                .collect();
+            telemetry.record(json!({"event":"model_tool_use","status":status,"tool_call_count":calls.len(),"tool_calls":calls,"available_tools":definitions.iter().map(|tool| &tool["function"]["name"]).collect::<Vec<_>>(),"error":error}));
+            telemetry.report_error(emit);
+        };
+        let response = request_with_id(
             &config.local,
             &completion_payload(&config.local, request_messages, &definitions),
             stop,
             emit,
+            &request_id,
         )?;
         if let Some(error) = response.get("error") {
+            record_response(&Value::Null, "api_error", error["message"].as_str());
             emit_prompt_usage(&response, "", emit);
             return Err(server_error(&config.local, error));
         }
         let Some(choice) = response["choices"].get(0) else {
+            record_response(&Value::Null, "invalid_response", Some("No choices"));
             emit_prompt_usage(&response, "", emit);
             return Err("Local server returned no choices.".into());
         };
         let raw_message = &choice["message"];
         if choice["finish_reason"] == "length" {
+            record_response(raw_message, "truncated", None);
             emit_prompt_usage(&response, "", emit);
             return Err("Local model reached its response limit. Shorten the request or use a model with a larger output limit.".into());
         }
         let message = match normalize_with_tools(raw_message, &definitions) {
             Ok(message) => message,
             Err(error) => {
+                record_response(raw_message, "rejected", Some(&error));
                 emit(Event::Message {
                     item: uuid::Uuid::new_v4().to_string(),
                     role: "Diagnostics".into(),
@@ -547,6 +580,7 @@ fn run(
                 continue;
             }
         };
+        record_response(&message, "accepted", None);
         // Drop transient correction requests before saving the accepted answer.
         for _ in 0..repair_attempts {
             messages.pop();
@@ -578,45 +612,66 @@ fn run(
         }
         let execute = |call: &Value| {
             let name = call["function"]["name"].as_str().unwrap_or("");
-            serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("{}"))
-                .map_err(|e| format!("Invalid tool arguments: {e}"))
-                .and_then(|args| {
-                    if w.mode == crate::store::Mode::Thinker && name == "spawn_builder_workstream" {
-                        return crate::delegation_ipc::call(
-                            w.delegation_endpoint
-                                .as_ref()
-                                .ok_or("Missing Skyforge handoff endpoint")?,
-                            &w.id,
-                            w.invocation_turn
-                                .as_deref()
-                                .ok_or("Missing Thinker request identity")?,
-                            &args,
-                        );
-                    }
-                    if w.mode == crate::store::Mode::Thinker
-                        && config.search
-                        && matches!(name, "web_search" | "fetch_url")
-                    {
-                        return crate::research::tool(name, &args, stop);
-                    }
-                    if w.mode == crate::store::Mode::Thinker
-                        && matches!(
-                            name,
-                            "search_conversations" | "read_conversation" | "search_memories"
-                        )
-                    {
-                        crate::thinker::read_tool(
-                            name,
-                            &args,
-                            w.memory_db.as_deref().ok_or("Missing memory database")?,
-                            w.thinker_project.as_deref(),
-                        )
-                    } else {
-                        tool(name, &args, project, writable, restart, stop)
-                    }
-                })
+            telemetry.record(json!({"event":"tool_execution","phase":"started","tool_call_id":call["id"],"tool":name}));
+            let started = Instant::now();
+            let result = serde_json::from_str::<Value>(
+                call["function"]["arguments"].as_str().unwrap_or("{}"),
+            )
+            .map_err(|e| format!("Invalid tool arguments: {e}"))
+            .and_then(|args| {
+                if w.mode == crate::store::Mode::Thinker && name == "spawn_builder_workstream" {
+                    return crate::delegation_ipc::call(
+                        w.delegation_endpoint
+                            .as_ref()
+                            .ok_or("Missing Skyforge handoff endpoint")?,
+                        &w.id,
+                        w.invocation_turn
+                            .as_deref()
+                            .ok_or("Missing Thinker request identity")?,
+                        &args,
+                    );
+                }
+                if w.mode == crate::store::Mode::Thinker
+                    && config.search
+                    && matches!(name, "web_search" | "fetch_url")
+                {
+                    return crate::research::tool(name, &args, stop);
+                }
+                if w.mode == crate::store::Mode::Thinker
+                    && matches!(
+                        name,
+                        "search_conversations" | "read_conversation" | "search_memories"
+                    )
+                {
+                    crate::thinker::read_tool(
+                        name,
+                        &args,
+                        w.memory_db.as_deref().ok_or("Missing memory database")?,
+                        w.thinker_project.as_deref(),
+                    )
+                } else {
+                    tool(name, &args, project, writable, restart, stop)
+                }
+            });
+            let status = match &result {
+                Err(error) if error == "Stopped" => "cancelled",
+                Err(_) => "failed",
+                Ok(output)
+                    if output.starts_with("Tool error:")
+                        || (name == "run_command"
+                            && !output.starts_with("Command succeeded\n")) =>
+                {
+                    "failed"
+                }
+                Ok(output) if name == "read_file" && output.contains("\nTool error:") => {
+                    "partial_failure"
+                }
+                Ok(_) => "succeeded",
+            };
+            telemetry.record(json!({"event":"tool_execution","phase":"finished","tool_call_id":call["id"],"tool":name,"status":status,"duration_ms":started.elapsed().as_secs_f64() * 1000.0,"output_bytes":result.as_ref().ok().map(|s| s.len()),"error":result.as_ref().err().map(|s| runner::clip(s, 2000))}));
+            result
         };
-        execute_tool_calls(
+        let execution = execute_tool_calls(
             &calls,
             stop,
             &execute,
@@ -651,7 +706,9 @@ fn run(
                 messages.push(json!({"role":"tool","tool_call_id":id,"content":output}));
                 save_history(history_path, &messages)
             },
-        )?;
+        );
+        telemetry.report_error(emit);
+        execution?;
         save_history(history_path, &messages)?;
     }
     Err("Local agent stopped after 64 steps. Send another message to continue.".into())
@@ -1312,7 +1369,7 @@ pub fn discover_models(config: &Config) -> Result<ModelCatalog, String> {
     if config.api_key.contains(['\n', '\r']) {
         return Err("API key must be a single line.".into());
     }
-    let response = http_request(config, &url, None, &AtomicBool::new(false), 15, None)?;
+    let response = http_request(config, &url, None, &AtomicBool::new(false), 15, None, None)?;
     if let Some(error) = response.get("error") {
         return Err(format!(
             "Local server: {}",
@@ -1398,6 +1455,22 @@ fn request(
     stop: &AtomicBool,
     emit: &impl Fn(Event),
 ) -> Result<Value, String> {
+    request_with_id(
+        config,
+        payload,
+        stop,
+        emit,
+        &uuid::Uuid::new_v4().to_string(),
+    )
+}
+
+fn request_with_id(
+    config: &Config,
+    payload: &Value,
+    stop: &AtomicBool,
+    emit: &impl Fn(Event),
+    request_id: &str,
+) -> Result<Value, String> {
     http_request(
         config,
         &endpoint(&config.host)?,
@@ -1405,6 +1478,7 @@ fn request(
         stop,
         300,
         Some(emit),
+        Some(request_id),
     )
 }
 
@@ -1415,6 +1489,7 @@ fn http_request(
     stop: &AtomicBool,
     timeout: u64,
     emit: Option<&dyn Fn(Event)>,
+    request_id: Option<&str>,
 ) -> Result<Value, String> {
     // Keep credentials off argv and out of shell/environment history; curl reads its
     // config from stdin, and the JSON body from a private temporary file.
@@ -1422,7 +1497,7 @@ fn http_request(
     let body = temp.0.join("request.json");
     let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let mut input = format!("url = \"{}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Content-Type: application/json\"\n", quote(url), quote(&config.api_key));
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_id = request_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let log = |direction: &str, body: &str, status: Option<&str>| {
         if payload.is_some() {
             if let Err(error) = log_http_json(config, &request_id, direction, url, body, status) {
@@ -1532,6 +1607,43 @@ fn log_http_json(
         // Authorization headers are never included.
         "body": body,
     });
+    append_model_log(config, &record)
+}
+
+struct ToolTelemetry<'a> {
+    config: &'a Config,
+    context: Value,
+    error: Mutex<Option<String>>,
+}
+
+impl ToolTelemetry<'_> {
+    fn record(&self, details: Value) {
+        let mut record = self.context.clone();
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(details.as_object().unwrap().clone());
+        record["timestamp"] = json!(chrono::Utc::now().to_rfc3339());
+        if let Err(error) = append_model_log(self.config, &record) {
+            let mut first = self.error.lock().unwrap();
+            if first.is_none() {
+                *first = Some(error);
+            }
+        }
+    }
+
+    fn report_error(&self, emit: &impl Fn(Event)) {
+        if let Some(error) = self.error.lock().unwrap().take() {
+            emit(Event::Message {
+                item: uuid::Uuid::new_v4().to_string(),
+                role: "Diagnostics".into(),
+                body: format!("Could not write tool-use telemetry: {error}"),
+            });
+        }
+    }
+}
+
+fn append_model_log(config: &Config, record: &Value) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     let path = http_log_path(config);
@@ -1965,6 +2077,8 @@ mod tests {
         let fixture = thread::spawn(move || {
             let (mut socket, _) = server.accept().unwrap();
             let first = receive(&mut socket);
+            assert_eq!(first["messages"][0]["content"], "You are a helpful software engineer assistant.");
+            assert!(first["tools"].as_array().unwrap().iter().all(|tool| tool["function"]["name"] != "request_restart"));
             assert_eq!(first["max_tokens"], 8192);
             respond(
                 &mut socket,
@@ -1984,6 +2098,7 @@ mod tests {
             );
             let (mut socket, _) = server.accept().unwrap();
             let third = receive(&mut socket);
+            assert_eq!(third["messages"][0]["content"], "You are a helpful software engineer assistant.");
             assert_eq!(
                 third["messages"][2]["reasoning_content"],
                 "private tool reasoning"
@@ -2002,6 +2117,7 @@ mod tests {
         w.draft = "Read README.md".into();
         let history_path = root.join("history.json");
         let events = std::cell::RefCell::new(Vec::new());
+        let restart_path = root.join("restart.request");
         for draft in ["Read README.md", "Confirm"] {
             w.draft = draft.into();
             run(
@@ -2009,7 +2125,7 @@ mod tests {
                 &w,
                 &root,
                 &history_path,
-                None,
+                Some(&restart_path),
                 &AtomicBool::new(false),
                 &|event| events.borrow_mut().push(event),
             )
@@ -2254,6 +2370,94 @@ mod tests {
         assert!(!std::fs::read_to_string(history_path)
             .unwrap()
             .contains("Prompt cache hit"));
+        let log = std::fs::read_to_string(http_log_path(&cfg.local)).unwrap();
+        let records: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let responses: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "model_tool_use")
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["tool_call_count"], 1);
+        assert_eq!(responses[1]["tool_call_count"], 0);
+        let executions: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "tool_execution")
+            .collect();
+        assert_eq!(executions.len(), 2);
+        assert_eq!(executions[0]["phase"], "started");
+        assert_eq!(executions[1]["phase"], "finished");
+        assert_eq!(executions[1]["status"], "succeeded");
+        assert_eq!(executions[1]["tool"], "read_file");
+        assert!(executions[1]["duration_ms"].as_f64().unwrap() >= 0.0);
+        for record in responses.iter().chain(executions.iter()) {
+            assert_eq!(record["model"], cfg.local.model);
+            assert_eq!(record["workstream_id"], w.id);
+            assert_eq!(record["run_id"], responses[0]["run_id"]);
+            assert!(records
+                .iter()
+                .any(|wire| wire["direction"] == "response"
+                    && wire["request_id"] == record["request_id"]));
+        }
+        assert_eq!(executions[1]["request_id"], responses[0]["request_id"]);
+        assert!(!log.contains("fixture-key"));
+    }
+
+    #[test]
+    fn tool_telemetry_distinguishes_rejected_calls_from_failed_executions() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.0.canonicalize().unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = config(&root, format!("http://{}", server.local_addr().unwrap()));
+        let fixture = thread::spawn(move || {
+            for message in [
+                json!({"role":"assistant","tool_calls":[{"id":"invalid","function":{"name":"unavailable_tool","arguments":"{}"}}]}),
+                json!({"role":"assistant","tool_calls":[{"id":"command","function":{"name":"run_command","arguments":"{\"command\":\"exit 7\"}"}}]}),
+                json!({"role":"assistant","content":"The command failed."}),
+            ] {
+                let (mut socket, _) = server.accept().unwrap();
+                receive(&mut socket);
+                respond(&mut socket, message);
+            }
+        });
+        let mut w = Workstream::new(&root);
+        w.draft = "Run a command".into();
+        run(
+            &cfg,
+            &w,
+            &root,
+            &root.join("history.json"),
+            None,
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
+        fixture.join().unwrap();
+        let records: Vec<Value> = std::fs::read_to_string(http_log_path(&cfg.local))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let decisions: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "model_tool_use")
+            .collect();
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(decisions[0]["status"], "rejected");
+        assert_eq!(decisions[0]["tool_calls"][0]["name"], "unavailable_tool");
+        assert_eq!(decisions[1]["status"], "accepted");
+        assert_eq!(decisions[2]["tool_call_count"], 0);
+        let executions: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "tool_execution")
+            .collect();
+        assert_eq!(executions.len(), 2);
+        assert!(executions
+            .iter()
+            .all(|record| record["tool"] == "run_command"));
+        assert_eq!(executions[1]["status"], "failed");
     }
 
     #[test]
