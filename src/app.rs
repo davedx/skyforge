@@ -58,6 +58,7 @@ pub struct Skyforge {
     messages: Vec<Message>,
     runs: HashMap<String, RunHandle>,
     activities: HashMap<String, BTreeMap<String, String>>,
+    run_agent_messages: HashMap<String, Vec<i64>>,
     tx: SyncSender<Envelope>,
     rx: Receiver<Envelope>,
     delegation_host: crate::delegation_ipc::Host,
@@ -248,6 +249,7 @@ impl Skyforge {
             repository_watch: None,
             runs: HashMap::new(),
             activities: HashMap::new(),
+            run_agent_messages: HashMap::new(),
             files: vec![],
             tree: FileNode::default(),
             scanning: false,
@@ -767,18 +769,58 @@ impl Skyforge {
                         items.remove(&item);
                     }
                     match self.store.add_message(&id, &role, &body, &[]) {
-                        Ok(message) if index == self.active => {
-                            self.messages.push(message);
-                            if !self.history_context && self.messages.len() > 200 {
-                                self.messages.drain(..self.messages.len() - 200);
+                        Ok(message) => {
+                            if role == "Agent" {
+                                self.run_agent_messages
+                                    .entry(id.clone())
+                                    .or_default()
+                                    .push(message.id);
                             }
-                            self.follow_tail = true;
+                            if index == self.active {
+                                self.messages.push(message);
+                                if !self.history_context && self.messages.len() > 200 {
+                                    self.messages.drain(..self.messages.len() - 200);
+                                }
+                                self.follow_tail = true;
+                            }
                         }
-                        Ok(_) => {}
                         Err(e) => self.notice = Some(format!("Could not save agent output: {e}")),
                     }
                 }
+                Event::Performance(performance) => {
+                    if let (Some(total), Some(session)) = (
+                        performance.session_output_tokens,
+                        self.tabs[index].session.as_deref(),
+                    ) {
+                        if let Err(error) = self.store.set_setting(
+                            &format!("codex_output_tokens:{session}"),
+                            &total.to_string(),
+                        ) {
+                            self.notice = Some(format!("Could not save token usage: {error}"));
+                        }
+                    }
+                    if let Some(message_ids) = self.run_agent_messages.get(&id) {
+                        for message_id in message_ids {
+                            if let Err(error) =
+                                self.store.set_message_performance(*message_id, performance)
+                            {
+                                self.notice =
+                                    Some(format!("Could not save response speed: {error}"));
+                            }
+                            if index == self.active {
+                                if let Some(message) = self
+                                    .messages
+                                    .iter_mut()
+                                    .find(|message| message.id == *message_id)
+                                {
+                                    message.performance = Some(performance);
+                                }
+                            }
+                        }
+                    }
+                }
                 Event::Finished { status } => {
+                    self.run_agent_messages.remove(&id);
                     if let Some(run) = self.runs.remove(&id) {
                         run.finish();
                     }
@@ -1172,6 +1214,12 @@ impl Skyforge {
                 .into_owned();
             crate::thinker::prepare(&mut submitted, &self.store)?;
         }
+        if runner::provider(&submitted.model) == "codex" {
+            submitted.output_tokens_baseline = submitted
+                .session
+                .as_deref()
+                .and_then(|session| self.store.codex_output_tokens(session));
+        }
         let w = &submitted;
         self.store
             .save_submission(w)
@@ -1208,6 +1256,7 @@ impl Skyforge {
                 self.notice = Some(format!("Could not save Builder startup state: {error}"));
             }
         }
+        self.run_agent_messages.insert(w.id.clone(), Vec::new());
         self.runs.insert(w.id.clone(), run);
         self.tabs[index].model = w.model.clone();
         self.tabs[index].session = w.session.clone();
@@ -2796,6 +2845,12 @@ impl Skyforge {
                                 ui.label(
                                     RichText::new(time(message.created)).size(15.0).color(MUTED),
                                 );
+                                if message.role == "Agent" {
+                                    if let Some(performance) = &message.performance {
+                                        ui.label(RichText::new(performance.label()).size(15.0).color(MUTED))
+                                            .on_hover_text(performance.tooltip());
+                                    }
+                                }
                             });
                             ui.add_space(2.0);
                             }
@@ -5169,6 +5224,119 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
     }
 
     #[test]
+    fn query_performance_is_inline_persisted_and_separate_for_each_run() {
+        let data = std::env::temp_dir().join(format!("skyforge-tps-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Skyforge::load(&ctx, Some(data.clone()), data.join("state")).unwrap();
+        let id = app.tabs[app.active].id.clone();
+        app.tabs[app.active].session = Some("performance-session".into());
+        app.store.save(&app.tabs[app.active]).unwrap();
+        app.store
+            .add_message(&id, "Agent", "Old reply", &[])
+            .unwrap();
+        let dispatch = |app: &mut Skyforge, event| {
+            app.tx
+                .send(Envelope {
+                    workstream: id.clone(),
+                    event,
+                })
+                .unwrap();
+            app.process_events(&ctx);
+        };
+        dispatch(
+            &mut app,
+            Event::Message {
+                item: "first".into(),
+                role: "Agent".into(),
+                body: "First reply".into(),
+            },
+        );
+        dispatch(
+            &mut app,
+            Event::Message {
+                item: "tool".into(),
+                role: "Tool".into(),
+                body: "Tool output".into(),
+            },
+        );
+        dispatch(
+            &mut app,
+            Event::Message {
+                item: "last".into(),
+                role: "Agent".into(),
+                body: "Last reply".into(),
+            },
+        );
+        dispatch(
+            &mut app,
+            Event::Performance(crate::performance::Performance::new(
+                140,
+                Duration::from_secs(10),
+                false,
+            )),
+        );
+        let messages = app.store.messages(&id, None).unwrap();
+        assert!(messages[0].performance.is_none());
+        assert_eq!(messages[1].performance.unwrap().label(), "14 tps");
+        assert!(messages[2].performance.is_none());
+        assert_eq!(messages[3].performance.unwrap().label(), "14 tps");
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.conversation(ui));
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "14 tps")));
+        dispatch(
+            &mut app,
+            Event::Finished {
+                status: "Complete".into(),
+            },
+        );
+        dispatch(
+            &mut app,
+            Event::Message {
+                item: "next".into(),
+                role: "Agent".into(),
+                body: "Another query".into(),
+            },
+        );
+        dispatch(
+            &mut app,
+            Event::Performance(crate::performance::Performance::new(
+                40,
+                Duration::from_secs(2),
+                true,
+            )),
+        );
+        let mut cumulative = crate::performance::Performance::new(40, Duration::from_secs(2), true);
+        cumulative.session_output_tokens = Some(300);
+        dispatch(&mut app, Event::Performance(cumulative));
+        assert_eq!(
+            app.store.codex_output_tokens("performance-session"),
+            Some(300)
+        );
+        let messages = app.store.messages(&id, None).unwrap();
+        assert_eq!(messages[1].performance.unwrap().label(), "14 tps");
+        assert_eq!(
+            messages.last().unwrap().performance.unwrap().label(),
+            "~20 tps"
+        );
+        drop(app);
+        let app = Skyforge::load(&ctx, Some(data.clone()), data.join("state")).unwrap();
+        assert_eq!(
+            app.store.codex_output_tokens("performance-session"),
+            Some(300)
+        );
+        let messages = app.store.messages(&id, None).unwrap();
+        assert_eq!(messages[3].performance.unwrap().label(), "14 tps");
+        assert_eq!(
+            messages.last().unwrap().performance.unwrap().label(),
+            "~20 tps"
+        );
+        drop(app);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
     fn conversation_wraps_long_output_and_omits_tool_heading() {
         fn check_text(shape: &egui::Shape, width: f32) {
             match shape {
@@ -5214,6 +5382,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
                     body,
                     attachments: vec![],
                     created: 0,
+                    performance: None,
                 }];
                 let output = ctx.run(
                     egui::RawInput {
@@ -5248,6 +5417,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
             body: body.into(),
             attachments: vec![],
             created: 0,
+            performance: None,
         })
         .collect();
         let output = ctx.run(

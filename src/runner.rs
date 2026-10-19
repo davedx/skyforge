@@ -26,6 +26,7 @@ pub enum Event {
         role: String,
         body: String,
     },
+    Performance(crate::performance::Performance),
     Finished {
         status: String,
     },
@@ -345,7 +346,24 @@ pub fn start_agent(
             std::env::current_exe().map_err(|e| e.to_string())?,
         );
     }
-    Ok(start(command, Some(prompt), true, w.id.clone(), tx, ctx))
+    let baseline = if provider(&w.model) == "codex" {
+        Some(if w.session.is_none() || thinker {
+            Some(0)
+        } else {
+            w.output_tokens_baseline
+        })
+    } else {
+        None
+    };
+    Ok(start_with_baseline(
+        command,
+        Some(prompt),
+        true,
+        w.id.clone(),
+        tx,
+        ctx,
+        baseline,
+    ))
 }
 
 fn agent_prompt(w: &Workstream, restart_available: bool) -> Result<String, String> {
@@ -581,17 +599,31 @@ fn parse_events(value: &Value) -> Vec<Event> {
     }
 }
 
+#[cfg(test)]
 fn start(
-    mut cmd: Command,
+    cmd: Command,
     prompt: Option<String>,
     json: bool,
     id: String,
     tx: SyncSender<Envelope>,
     ctx: egui::Context,
 ) -> RunHandle {
+    start_with_baseline(cmd, prompt, json, id, tx, ctx, None)
+}
+
+fn start_with_baseline(
+    mut cmd: Command,
+    prompt: Option<String>,
+    json: bool,
+    id: String,
+    tx: SyncSender<Envelope>,
+    ctx: egui::Context,
+    codex_baseline: Option<Option<u64>>,
+) -> RunHandle {
     let cancelled = Arc::new(AtomicBool::new(false));
     let stop = cancelled.clone();
     let join = thread::spawn(move || {
+        let started = Instant::now();
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(if prompt.is_some() {
@@ -671,6 +703,8 @@ fn start(
             let (tx, ctx, id, failed) = (tx.clone(), ctx.clone(), id.clone(), failed.clone());
             readers.push(thread::spawn(move || {
                 let mut output = String::new();
+                let mut output_tokens: Option<u64> = None;
+                let mut output_characters = 0;
                 let mut last_update = Instant::now() - Duration::from_secs(1);
                 // read_line is limited via take on each line to bound malformed JSON/tool output.
                 let mut reader = BufReader::new(reader);
@@ -691,7 +725,26 @@ fn start(
                             {
                                 failed.store(true, Ordering::SeqCst);
                             }
+                            match value["type"].as_str() {
+                                Some("turn.completed") => {
+                                    if let Some(tokens) = value["usage"]["output_tokens"].as_u64() {
+                                        output_tokens = Some(tokens);
+                                    }
+                                }
+                                Some("result") => {
+                                    // Claude's result usage is the total for this invocation.
+                                    if let Some(tokens) = value["usage"]["output_tokens"].as_u64() {
+                                        output_tokens = Some(tokens);
+                                    }
+                                }
+                                _ => {}
+                            }
                             for event in parse_events(&value) {
+                                if let Event::Message { role, body, .. } = &event {
+                                    if matches!(role.as_str(), "Agent" | "Thinking") {
+                                        output_characters += body.chars().count();
+                                    }
+                                }
                                 send(&tx, &ctx, &id, event);
                             }
                             continue;
@@ -713,6 +766,28 @@ fn start(
                             },
                         );
                     }
+                }
+                if json && !stderr && (output_tokens.is_some() || output_characters > 0) {
+                    send(
+                        &tx,
+                        &ctx,
+                        &id,
+                        Event::Performance(match (codex_baseline, output_tokens) {
+                            (Some(baseline), Some(total)) => crate::performance::codex_performance(
+                                total,
+                                baseline,
+                                output_characters,
+                                started.elapsed(),
+                            ),
+                            _ => crate::performance::Performance::new(
+                                output_tokens.unwrap_or_else(|| {
+                                    crate::performance::estimate_tokens(output_characters)
+                                }),
+                                started.elapsed(),
+                                output_tokens.is_none(),
+                            ),
+                        }),
+                    );
                 }
                 if !output.is_empty() {
                     send(
@@ -1216,6 +1291,73 @@ JSON
             -1,
             "Descendant must not keep running after Stop"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cli_performance_uses_provider_counts_and_marks_missing_usage_as_estimated() {
+        for (events, expected, estimated, baseline) in [
+            (
+                r#"{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"Some response"}}
+{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":140}}"#,
+                140,
+                false,
+                Some(Some(0)),
+            ),
+            (
+                r#"{"type":"assistant","message":{"id":"answer","content":[{"type":"text","text":"Some response"}]}}
+{"type":"result","usage":{"input_tokens":2000,"output_tokens":70}}"#,
+                70,
+                false,
+                None,
+            ),
+            (
+                r#"{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"12345678"}}"#,
+                2,
+                true,
+                Some(Some(0)),
+            ),
+            (
+                r#"{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"Yes, I’m here."}}
+{"type":"turn.completed","usage":{"output_tokens":21882}}"#,
+                10,
+                false,
+                Some(Some(21872)),
+            ),
+            (
+                r#"{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"12345678"}}
+{"type":"turn.completed","usage":{"output_tokens":21882}}"#,
+                2,
+                true,
+                Some(None),
+            ),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", "cat"]);
+            let (tx, rx) = std::sync::mpsc::sync_channel(256);
+            let run = start_with_baseline(
+                command,
+                Some(events.into()),
+                true,
+                "test".into(),
+                tx,
+                egui::Context::default(),
+                baseline,
+            );
+            let mut performance = None;
+            loop {
+                match rx.recv_timeout(Duration::from_secs(5)).unwrap().event {
+                    Event::Performance(stats) => performance = Some(stats),
+                    Event::Finished { .. } => break,
+                    _ => {}
+                }
+            }
+            run.finish();
+            let performance = performance.unwrap();
+            assert_eq!(performance.output_tokens, expected);
+            assert_eq!(performance.estimated, estimated);
+            assert!(performance.elapsed_seconds > 0.0);
+        }
     }
 
     #[test]

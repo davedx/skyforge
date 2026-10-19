@@ -4,6 +4,7 @@ mod delegation_ipc;
 mod editor;
 mod local;
 mod markdown;
+mod performance;
 mod repository;
 mod repository_search;
 mod research;

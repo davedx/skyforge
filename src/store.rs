@@ -72,6 +72,8 @@ pub struct Workstream {
     pub memory_db: Option<PathBuf>,
     #[serde(skip)]
     pub delegation_endpoint: Option<crate::delegation_ipc::Endpoint>,
+    #[serde(skip)]
+    pub output_tokens_baseline: Option<u64>,
 }
 
 impl Workstream {
@@ -95,6 +97,7 @@ impl Workstream {
             instructions_path: None,
             memory_db: None,
             delegation_endpoint: None,
+            output_tokens_baseline: None,
         }
     }
 }
@@ -106,6 +109,7 @@ pub struct Message {
     pub body: String,
     pub attachments: Vec<String>,
     pub created: i64,
+    pub performance: Option<crate::performance::Performance>,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +184,13 @@ impl Store {
         }
         if !columns.iter().any(|column| column == "thinker_project") {
             conn.execute_batch("ALTER TABLE workstreams ADD COLUMN thinker_project TEXT REFERENCES thinker_projects(id);")?;
+        }
+        let message_columns = conn
+            .prepare("PRAGMA table_info(messages)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !message_columns.iter().any(|column| column == "performance") {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN performance TEXT;")?;
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS thinker_projects (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, instructions TEXT NOT NULL DEFAULT '', directory TEXT);
@@ -274,6 +285,7 @@ impl Store {
             instructions_path: None,
             memory_db: None,
             delegation_endpoint: None,
+            output_tokens_baseline: None,
         })
     }
 
@@ -309,12 +321,51 @@ impl Store {
             body: body.into(),
             attachments: attachments.to_vec(),
             created,
+            performance: None,
         })
+    }
+
+    pub fn codex_output_tokens(&self, session: &str) -> Option<u64> {
+        if let Some(tokens) = self.setting(&format!("codex_output_tokens:{session}")) {
+            return tokens.parse().ok();
+        }
+        // Upgrade counters saved by the initial TPS implementation, which stored
+        // Codex's cumulative total as the reply's output count.
+        let json: String = self
+            .conn
+            .query_row(
+                "SELECT m.performance FROM messages m JOIN workstreams w ON w.id=m.workstream
+             WHERE w.session=?1 AND m.role='Agent' AND m.performance IS NOT NULL
+             ORDER BY m.id DESC LIMIT 1",
+                [session],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+        if value.get("session_output_tokens").is_some() {
+            value["session_output_tokens"].as_u64()
+        } else if value["estimated"] == false {
+            value["output_tokens"].as_u64()
+        } else {
+            None
+        }
+    }
+
+    pub fn set_message_performance(
+        &self,
+        id: i64,
+        performance: crate::performance::Performance,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET performance=?2 WHERE id=?1 AND role='Agent'",
+            params![id, serde_json::to_string(&performance)?],
+        )?;
+        Ok(())
     }
 
     pub fn messages(&self, id: &str, before: Option<i64>) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,role,body,attachments,created FROM messages
+            "SELECT id,role,body,attachments,created,performance FROM messages
             WHERE workstream=?1 AND id < ?2 ORDER BY id DESC LIMIT 100",
         )?;
         let mut rows = stmt
@@ -326,6 +377,9 @@ impl Store {
                     body: row.get(2)?,
                     attachments: serde_json::from_str(&a).unwrap_or_default(),
                     created: row.get(4)?,
+                    performance: row
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|json| serde_json::from_str(&json).ok()),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

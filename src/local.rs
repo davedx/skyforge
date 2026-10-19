@@ -439,6 +439,73 @@ fn run(
     stop: &AtomicBool,
     emit: &impl Fn(Event),
 ) -> Result<(), String> {
+    let started = Instant::now();
+    let mut output_tokens = 0;
+    let mut estimated = false;
+    let mut responses = 0;
+    let result = run_inner(
+        config,
+        w,
+        project,
+        history_path,
+        restart,
+        stop,
+        emit,
+        &mut |response: &Value| {
+            responses += 1;
+            let tokens = response["usage"]["completion_tokens"]
+                .as_u64()
+                .or_else(|| response["usage"]["output_tokens"].as_u64());
+            output_tokens += tokens.unwrap_or_else(|| {
+                estimated = true;
+                let message = &response["choices"][0]["message"];
+                let characters = ["content", "reasoning_content", "reasoning"]
+                    .iter()
+                    .filter_map(|key| message.get(key))
+                    .filter(|value| !value.is_null())
+                    .map(|value| {
+                        value.as_str().map_or_else(
+                            || value.to_string().chars().count(),
+                            |text| text.chars().count(),
+                        )
+                    })
+                    .sum::<usize>()
+                    + message["tool_calls"].as_array().map_or(0, |calls| {
+                        calls
+                            .iter()
+                            .map(|call| {
+                                call["function"]["arguments"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .chars()
+                                    .count()
+                            })
+                            .sum::<usize>()
+                    });
+                crate::performance::estimate_tokens(characters)
+            });
+        },
+    );
+    if responses > 0 {
+        emit(Event::Performance(crate::performance::Performance::new(
+            output_tokens,
+            started.elapsed(),
+            estimated,
+        )));
+    }
+    result
+}
+
+fn run_inner(
+    config: &AgentConfig,
+    w: &Workstream,
+    project: &Path,
+    history_path: &Path,
+    restart: Option<&Path>,
+    stop: &AtomicBool,
+    emit: &impl Fn(Event),
+    record_usage: &mut impl FnMut(&Value),
+) -> Result<(), String> {
     let writable = config.writable && w.mode != crate::store::Mode::Thinker;
     let mut messages: Vec<Value> = match std::fs::read(history_path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -565,6 +632,7 @@ fn run(
             emit,
             &request_id,
         )?;
+        record_usage(&response);
         if let Some(error) = response.get("error") {
             record_response(&Value::Null, "api_error", error["message"].as_str());
             emit_prompt_usage(&response, "", emit);
@@ -2366,8 +2434,8 @@ mod tests {
         let cfg = config(&root, format!("http://{}", server.local_addr().unwrap()));
         let fixture = thread::spawn(move || {
             let responses = [
-                json!({"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]}}],"usage":{"prompt_cache_hit_tokens":100,"prompt_cache_miss_tokens":25}}),
-                json!({"choices":[{"message":{"role":"assistant","content":"Done."}}],"usage":{"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":150}}}),
+                json!({"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]}}],"usage":{"completion_tokens":120,"prompt_cache_hit_tokens":100,"prompt_cache_miss_tokens":25}}),
+                json!({"choices":[{"message":{"role":"assistant","content":"Done."}}],"usage":{"completion_tokens":20,"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":150}}}),
             ];
             for response in responses {
                 let (mut socket, _) = server.accept().unwrap();
@@ -2398,6 +2466,16 @@ mod tests {
         .unwrap();
         fixture.join().unwrap();
         let events = events.into_inner();
+        let stats = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Performance(performance) => Some(performance),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(stats.output_tokens, 140);
+        assert!(!stats.estimated);
+        assert!(stats.elapsed_seconds > 0.0);
         let messages: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
