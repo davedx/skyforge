@@ -78,8 +78,10 @@ fn relevant(root: &Path, event: &Event) -> bool {
         };
         if relative.components().any(|part| {
             let name = part.as_os_str().to_string_lossy();
-            matches!(name.as_ref(), "target" | "node_modules")
-                || (name.starts_with('.') && !matches!(name.as_ref(), ".gitignore" | ".ignore"))
+            matches!(
+                name.as_ref(),
+                "target" | "node_modules" | ".git" | ".harness"
+            )
         }) {
             return false;
         }
@@ -140,7 +142,7 @@ fn run(
         let mut directories = HashSet::new();
         let mut files = Vec::new();
         for entry in ignore::WalkBuilder::new(&root)
-            .hidden(true)
+            .hidden(false)
             .max_depth(Some(25))
             .filter_entry(|e| {
                 !matches!(
@@ -319,21 +321,25 @@ mod tests {
         git(&temp.0, &["init"]);
         std::fs::create_dir_all(temp.0.join("generated/nested")).unwrap();
         std::fs::write(temp.0.join("generated/nested/a.txt"), "a").unwrap();
+        std::fs::create_dir(temp.0.join(".vitepress")).unwrap();
+        std::fs::write(temp.0.join(".vitepress/config.ts"), "export default {}").unwrap();
+        std::fs::write(temp.0.join(".env"), "EXAMPLE=value").unwrap();
         std::fs::write(temp.0.join(".gitignore"), "generated/\n").unwrap();
         let watch = RepositoryWatch::new(temp.0.clone(), egui::Context::default());
-        wait_for(&watch, &[]);
+        let dotfiles = [".env", ".gitignore", ".vitepress/config.ts"];
+        wait_for(&watch, &dotfiles);
         std::fs::write(temp.0.join(".gitignore"), "").unwrap();
         watch.refresh();
-        wait_for(&watch, &["generated/nested/a.txt"]);
+        let mut expected = dotfiles.to_vec();
+        expected.push("generated/nested/a.txt");
+        wait_for(&watch, &expected);
         std::fs::write(temp.0.join("generated/nested/b.txt"), "b").unwrap();
         watch.refresh();
-        wait_for(
-            &watch,
-            &["generated/nested/a.txt", "generated/nested/b.txt"],
-        );
+        expected.push("generated/nested/b.txt");
+        wait_for(&watch, &expected);
         std::fs::write(temp.0.join(".gitignore"), "generated/\n").unwrap();
         watch.refresh();
-        wait_for(&watch, &[]);
+        wait_for(&watch, &dotfiles);
     }
 
     #[test]
@@ -359,6 +365,9 @@ mod tests {
             ".harness/state",
         ] {
             assert!(!relevant(root, &event(EventKind::Any, path)));
+        }
+        for path in [".env", ".vitepress/config.ts", "src/.config/settings.json"] {
+            assert!(relevant(root, &event(EventKind::Any, path)));
         }
         assert!(relevant(
             root,

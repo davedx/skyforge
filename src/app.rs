@@ -78,6 +78,9 @@ pub struct Skyforge {
     show_editor: bool,
     pending_file: Option<PathBuf>,
     new_file: Option<NewFile>,
+    rename_file: Option<RenameFile>,
+    repository_find: RepositoryFind,
+    pending_search_match: Option<(crate::repository_search::Match, String)>,
     find_open: bool,
     find_focus: bool,
     find_jump: bool,
@@ -119,6 +122,23 @@ struct NewFile {
     name: String,
     error: Option<String>,
     focus: bool,
+}
+
+struct RenameFile {
+    path: PathBuf,
+    name: String,
+    error: Option<String>,
+    focus: bool,
+}
+
+#[derive(Default)]
+struct RepositoryFind {
+    open: bool,
+    focus: bool,
+    query: String,
+    due: Option<Instant>,
+    job: Option<crate::repository_search::Job>,
+    results: crate::repository_search::Results,
 }
 
 impl Skyforge {
@@ -242,6 +262,9 @@ impl Skyforge {
             show_editor: false,
             pending_file: None,
             new_file: None,
+            rename_file: None,
+            repository_find: RepositoryFind::default(),
+            pending_search_match: None,
             find_open: false,
             find_focus: false,
             find_jump: false,
@@ -576,6 +599,9 @@ impl Skyforge {
     fn sync_repository_watch(&mut self, ctx: &egui::Context) {
         if self.tabs[self.active].mode == Mode::Thinker {
             self.new_file = None;
+            self.rename_file = None;
+            self.repository_find = RepositoryFind::default();
+            self.pending_search_match = None;
             self.repository_watch = None;
             self.scanning = false;
             return;
@@ -589,6 +615,9 @@ impl Skyforge {
             return;
         }
         self.new_file = None;
+        self.rename_file = None;
+        self.repository_find = RepositoryFind::default();
+        self.pending_search_match = None;
         self.files.clear();
         self.tree = FileNode::default();
         self.scanning = true;
@@ -1271,8 +1300,16 @@ impl Skyforge {
     }
 
     fn open_file(&mut self, path: PathBuf) {
+        if self
+            .pending_search_match
+            .as_ref()
+            .is_some_and(|(hit, _)| hit.path != path)
+        {
+            self.pending_search_match = None;
+        }
         if self.editor.as_ref().is_some_and(|e| e.path == path) {
             self.show_editor = true;
+            self.apply_search_match();
             return;
         }
         if self.editor.as_ref().is_some_and(FileBuffer::dirty) {
@@ -1290,6 +1327,7 @@ impl Skyforge {
             }
             Err(e) => self.notice = Some(e),
         }
+        self.apply_search_match();
     }
 
     fn save_file(&mut self) -> bool {
@@ -1324,8 +1362,66 @@ impl Skyforge {
             self.pending_file = None;
             self.file_decision = false;
         }
+        if self
+            .pending_search_match
+            .as_ref()
+            .is_some_and(|(hit, _)| hit.path == path)
+        {
+            self.pending_search_match = None;
+        }
         self.files.retain(|file| file != path);
         self.tree = FileNode::build(Path::new(&self.tabs[self.active].project), &self.files);
+    }
+
+    fn rename_file(&mut self, path: &Path, name: &str) -> Result<(), String> {
+        if name.trim().is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0'])
+        {
+            return Err("Enter a filename without directory separators.".into());
+        }
+        let root = Path::new(&self.tabs[self.active].project);
+        let directory = path
+            .parent()
+            .ok_or("Choose a file in the current repository.")?;
+        let directory = directory.canonicalize().map_err(|e| e.to_string())?;
+        if self.tabs[self.active].mode != Mode::Builder || !directory.starts_with(root) {
+            return Err("Choose a file in the current repository.".into());
+        }
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if metadata.is_dir() {
+            return Err("Choose a file to rename.".into());
+        }
+        let target = path.with_file_name(name);
+        if target == path {
+            return Ok(());
+        }
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => return Err(format!("{name} already exists. Choose another name.")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot rename file: {error}")),
+        }
+        std::fs::rename(path, &target).map_err(|error| format!("Cannot rename file: {error}"))?;
+        if let Some(editor) = &mut self.editor {
+            if editor.path == path {
+                editor.path = target.clone();
+            }
+        }
+        if self.pending_file.as_deref() == Some(path) {
+            self.pending_file = Some(target.clone());
+        }
+        if let Some((hit, _)) = &mut self.pending_search_match {
+            if hit.path == path {
+                hit.path = target.clone();
+            }
+        }
+        self.files.retain(|file| file != path);
+        self.files.push(target);
+        self.files.sort_unstable();
+        self.files.dedup();
+        self.tree = FileNode::build(root, &self.files);
+        if let Some(watch) = &self.repository_watch {
+            watch.refresh();
+        }
+        Ok(())
     }
 
     fn create_file(&mut self, directory: &Path, name: &str) -> Result<(), String> {
@@ -1663,6 +1759,7 @@ impl Skyforge {
         }
         let mut open = None;
         let mut delete = None;
+        let mut rename = None;
         egui::ScrollArea::vertical()
             .id_salt("file_tree")
             .show(ui, |ui| {
@@ -1673,6 +1770,7 @@ impl Skyforge {
                         self.editor.as_ref().map(|e| e.path.as_path()),
                         &mut open,
                         &mut delete,
+                        &mut rename,
                         &mut create,
                     );
                 } else {
@@ -1688,7 +1786,7 @@ impl Skyforge {
                             .unwrap_or(path)
                             .display()
                             .to_string();
-                        file_entry(ui, path, label, false, &mut open, &mut delete, &mut create);
+                        file_entry(ui, path, label, false, &mut open, &mut delete, &mut rename);
                     }
                 }
             });
@@ -1696,6 +1794,17 @@ impl Skyforge {
             self.new_file = Some(NewFile {
                 directory,
                 name: String::new(),
+                error: None,
+                focus: true,
+            });
+        } else if let Some(path) = rename {
+            self.rename_file = Some(RenameFile {
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                path,
                 error: None,
                 focus: true,
             });
@@ -1947,14 +2056,180 @@ impl Skyforge {
     }
 
     fn file_find_shortcut(&mut self, ctx: &egui::Context) {
+        if self.tabs[self.active].mode == Mode::Builder
+            && ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::F,
+                )
+            })
+        {
+            self.find_open = false;
+            self.repository_find.open = true;
+            self.repository_find.focus = true;
+            self.repository_find.due = Some(Instant::now());
+            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("repository_find_input")));
+            return;
+        }
         if self.show_editor
             && self.editor.is_some()
             && self.tabs[self.active].mode == Mode::Builder
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F))
         {
+            self.repository_find.open = false;
             self.find_open = true;
             self.find_focus = true;
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("file_find_input")));
+        }
+    }
+
+    fn open_search_match(&mut self, hit: crate::repository_search::Match) {
+        self.pending_search_match = Some((hit.clone(), self.repository_find.query.clone()));
+        self.repository_find.open = false;
+        self.open_file(hit.path);
+    }
+
+    fn apply_search_match(&mut self) {
+        let Some((hit, query)) = &self.pending_search_match else {
+            return;
+        };
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        if editor.path != hit.path {
+            return;
+        }
+        editor.find = query.clone();
+        editor.find_match = if editor.text.get(hit.range.clone()) == Some(query.as_str()) {
+            Some(hit.range.clone())
+        } else {
+            editor
+                .text
+                .find(query)
+                .map(|start| start..start + query.len())
+        };
+        self.find_jump = true;
+        self.pending_search_match = None;
+    }
+
+    fn repository_find_dialog(&mut self, ctx: &egui::Context) {
+        if !self.repository_find.open {
+            return;
+        }
+        let search = &mut self.repository_find;
+        if search.due.is_some_and(|due| Instant::now() >= due) && !self.scanning {
+            search.due = None;
+            search.job = (!search.query.is_empty()).then(|| {
+                crate::repository_search::Job::start(
+                    self.files.clone(),
+                    search.query.clone(),
+                    ctx.clone(),
+                )
+            });
+        }
+        if let Some(results) = search
+            .job
+            .as_ref()
+            .and_then(|job| job.receiver.try_recv().ok())
+        {
+            search.results = results;
+            search.job = None;
+        }
+        let mut selected = None;
+        let mut close = false;
+        let response = egui::Modal::new(egui::Id::new("repository_find_dialog")).show(ctx, |ui| {
+            ui.set_width(650.0_f32.min(ctx.screen_rect().width() - 60.0));
+            ui.heading("Find in all files");
+            let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let mut input = TextEdit::singleline(&mut search.query)
+                .id(egui::Id::new("repository_find_input"))
+                .hint_text("Search text…")
+                .desired_width(f32::INFINITY)
+                .show(ui);
+            if search.focus {
+                input.response.request_focus();
+                input
+                    .state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(search.query.chars().count()),
+                    )));
+                input.state.store(ctx, input.response.id);
+                search.focus = false;
+            }
+            if input.response.changed() {
+                search.job = None;
+                search.results = Default::default();
+                search.due =
+                    (!search.query.is_empty()).then(|| Instant::now() + Duration::from_millis(150));
+            }
+            if search.due.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
+            ui.label(
+                RichText::new("Case-sensitive text · repository files · text files up to 2 MB")
+                    .color(MUTED),
+            );
+            let busy = search.job.is_some() || search.due.is_some();
+            if search.query.is_empty() {
+                ui.label("Enter text to search the repository.");
+            } else if busy {
+                ui.label("Searching…");
+            } else {
+                ui.label(format!(
+                    "{} matches{}",
+                    search.results.matches.len(),
+                    if search.results.truncated {
+                        " (first 1,000; refine your search)"
+                    } else {
+                        ""
+                    }
+                ));
+                if search.results.skipped > 0 {
+                    ui.label(format!(
+                        "{} binary, large, or unreadable files skipped",
+                        search.results.skipped
+                    ));
+                }
+            }
+            if enter && !busy {
+                selected = search.results.matches.first().cloned();
+                input.response.request_focus();
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("repository_search_results")
+                .max_height((ctx.screen_rect().height() * 0.55).max(100.0))
+                .show(ui, |ui| {
+                    for hit in &search.results.matches {
+                        let relative = hit
+                            .path
+                            .strip_prefix(&self.tabs[self.active].project)
+                            .unwrap_or(&hit.path);
+                        let label = format!(
+                            "{}:{}:{}\n{}",
+                            relative.display(),
+                            hit.line,
+                            hit.column,
+                            hit.preview
+                        );
+                        if ui
+                            .add(egui::Button::new(label).frame(false).wrap())
+                            .clicked()
+                        {
+                            selected = Some(hit.clone());
+                        }
+                    }
+                });
+            close = ui.button("Close").clicked();
+        });
+        if close || response.should_close() {
+            self.repository_find.open = false;
+            self.repository_find.job = None;
+        }
+        if let Some(hit) = selected {
+            self.open_search_match(hit);
+            ctx.request_repaint();
         }
     }
 
@@ -2902,6 +3177,7 @@ impl Skyforge {
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.wake_dialog(ctx);
         self.file_find_dialog(ctx);
+        self.repository_find_dialog(ctx);
         self.thinker_dialogs(ctx);
         if self.restart_decision {
             egui::Window::new("Before restarting Skyforge").collapsible(false).resizable(false).show(ctx, |ui| {
@@ -3056,6 +3332,46 @@ impl Skyforge {
                 }
             }
         }
+        if let Some(mut draft) = self.rename_file.take() {
+            let mut open = true;
+            let mut rename = false;
+            let mut cancel = false;
+            egui::Window::new("Rename file")
+                .id(egui::Id::new("rename_repository_file"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Rename {}", draft.path.display()));
+                    let input = ui.add(TextEdit::singleline(&mut draft.name).hint_text("Filename"));
+                    if draft.focus {
+                        input.request_focus();
+                        draft.focus = false;
+                    }
+                    rename = (input.has_focus() || input.lost_focus())
+                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                    cancel =
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                    if let Some(error) = &draft.error {
+                        ui.label(RichText::new(error).color(Color32::RED));
+                    }
+                    ui.horizontal(|ui| {
+                        rename |= ui.button("Rename").clicked();
+                        cancel |= ui.button("Cancel").clicked();
+                    });
+                });
+            if open && !cancel {
+                if rename {
+                    if let Err(error) = self.rename_file(&draft.path, &draft.name) {
+                        draft.error = Some(error);
+                        draft.focus = true;
+                        self.rename_file = Some(draft);
+                    }
+                } else {
+                    self.rename_file = Some(draft);
+                }
+            }
+        }
         if self.file_decision {
             egui::Window::new("Keep your file edits?")
                 .collapsible(false)
@@ -3079,6 +3395,7 @@ impl Skyforge {
                         if ui.button("Keep editing").clicked() {
                             self.file_decision = false;
                             self.pending_file = None;
+                            self.pending_search_match = None;
                         }
                     });
                 });
@@ -3288,6 +3605,7 @@ fn file_tree(
     selected: Option<&Path>,
     open: &mut Option<PathBuf>,
     delete: &mut Option<PathBuf>,
+    rename: &mut Option<PathBuf>,
     create: &mut Option<PathBuf>,
 ) {
     for (name, node) in tree.children.iter().filter(|(_, n)| !n.children.is_empty()) {
@@ -3295,7 +3613,7 @@ fn file_tree(
             .id_salt(&node.path)
             .default_open(name == "docs" || name == "src")
             .show(ui, |ui| {
-                file_tree(ui, node, selected, open, delete, create);
+                file_tree(ui, node, selected, open, delete, rename, create);
             })
             .header_response
             .context_menu(|ui| new_file_menu(ui, &node.path, create));
@@ -3308,7 +3626,7 @@ fn file_tree(
             selected == Some(node.path.as_path()),
             open,
             delete,
-            create,
+            rename,
         );
     }
 }
@@ -3320,7 +3638,7 @@ fn file_entry(
     selected: bool,
     open: &mut Option<PathBuf>,
     delete: &mut Option<PathBuf>,
-    create: &mut Option<PathBuf>,
+    rename: &mut Option<PathBuf>,
 ) {
     let response = ui
         .selectable_label(selected, label)
@@ -3329,8 +3647,9 @@ fn file_entry(
         *open = Some(path.to_path_buf());
     }
     response.context_menu(|ui| {
-        if let Some(directory) = path.parent() {
-            new_file_menu(ui, directory, create);
+        if ui.button("Rename file…").clicked() {
+            *rename = Some(path.to_path_buf());
+            ui.close_menu();
         }
         if ui.button("Delete file").clicked() {
             *delete = Some(path.to_path_buf());
@@ -4266,6 +4585,113 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
     }
 
     #[test]
+    fn repository_find_shortcut_searches_and_navigates_without_losing_edits() {
+        let data =
+            std::env::temp_dir().join(format!("skyforge-repo-find-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        let project = data.canonicalize().unwrap();
+        let first = project.join("first.txt");
+        let second = project.join("second.txt");
+        std::fs::write(&first, "🦀 café\nfirst").unwrap();
+        std::fs::write(&second, "second café").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Skyforge::load(&ctx, Some(project.clone()), data.join("state")).unwrap();
+        app.files = vec![first.clone(), second.clone()];
+        app.scanning = false;
+        let frame = |app: &mut Skyforge, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1360.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.file_find_shortcut(ctx);
+                    app.editor_ui(ctx);
+                    app.dialogs(ctx);
+                },
+            );
+        };
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            modifiers,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+        };
+        frame(
+            &mut app,
+            vec![key(
+                egui::Key::F,
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert!(app.repository_find.open);
+        assert!(!app.find_open);
+        assert!(app.editor.is_none());
+        frame(&mut app, vec![egui::Event::Text("café".into())]);
+        assert_eq!(app.repository_find.query, "café");
+        app.repository_find.due = Some(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.repository_find.results.matches.len() != 2 {
+            assert!(Instant::now() < deadline, "search did not finish");
+            frame(&mut app, vec![]);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        frame(&mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(!app.repository_find.open);
+        assert_eq!(app.editor.as_ref().unwrap().path, first);
+        assert_eq!(app.editor.as_ref().unwrap().find_match, Some(5..10));
+        frame(&mut app, vec![]);
+        let state =
+            egui::text_edit::TextEditState::load(&ctx, app.source_editor_id.unwrap()).unwrap();
+        let selection = state.cursor.char_range().unwrap();
+        assert_eq!(selection.primary.index.min(selection.secondary.index), 2);
+        assert_eq!(selection.primary.index.max(selection.secondary.index), 6);
+
+        app.editor.as_mut().unwrap().text.push_str(" unsaved");
+        let hit = app.repository_find.results.matches[1].clone();
+        app.open_search_match(hit);
+        assert!(app.file_decision);
+        assert_eq!(app.editor.as_ref().unwrap().path, first);
+        assert!(app.editor.as_ref().unwrap().dirty());
+        assert_eq!(app.pending_file.as_ref(), Some(&second));
+        assert!(app.save_file());
+        app.file_decision = false;
+        let pending = app.pending_file.take().unwrap();
+        app.open_file(pending);
+        assert_eq!(app.editor.as_ref().unwrap().path, second);
+        assert_eq!(app.editor.as_ref().unwrap().find_match, Some(7..12));
+        assert!(app.pending_search_match.is_none());
+        assert!(std::fs::read_to_string(&first)
+            .unwrap()
+            .ends_with(" unsaved"));
+
+        frame(
+            &mut app,
+            vec![key(
+                egui::Key::F,
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert!(app.repository_find.open);
+        frame(
+            &mut app,
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(!app.repository_find.open);
+        assert!(app.repository_find.job.is_none());
+        frame(&mut app, vec![key(egui::Key::F, egui::Modifiers::COMMAND)]);
+        assert!(app.find_open);
+        assert!(!app.repository_find.open);
+        drop(app);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
     fn repository_snapshots_refresh_editor_even_when_file_paths_are_unchanged() {
         let data =
             std::env::temp_dir().join(format!("skyforge-editor-watch-{}", uuid::Uuid::new_v4()));
@@ -4464,7 +4890,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
     }
 
     #[test]
-    fn new_file_dialog_supports_enter_errors_and_escape() {
+    fn file_name_dialogs_support_enter_errors_and_escape() {
         let data =
             std::env::temp_dir().join(format!("skyforge-create-ui-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&data).unwrap();
@@ -4518,6 +4944,33 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
         frame(&mut app, vec![]);
         frame(&mut app, vec![key(egui::Key::Escape)]);
         assert!(app.new_file.is_none());
+        assert!(!project.join("cancelled.txt").exists());
+
+        app.rename_file = Some(RenameFile {
+            path: project.join("keyboard.txt"),
+            name: String::new(),
+            error: None,
+            focus: true,
+        });
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![key(egui::Key::Enter)]);
+        assert!(app.rename_file.as_ref().unwrap().error.is_some());
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![egui::Event::Text("renamed.txt".into())]);
+        frame(&mut app, vec![key(egui::Key::Enter)]);
+        assert!(app.rename_file.is_none());
+        assert!(project.join("renamed.txt").is_file());
+        assert!(!project.join("keyboard.txt").exists());
+        app.rename_file = Some(RenameFile {
+            path: project.join("renamed.txt"),
+            name: "cancelled.txt".into(),
+            error: None,
+            focus: true,
+        });
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![key(egui::Key::Escape)]);
+        assert!(app.rename_file.is_none());
+        assert!(project.join("renamed.txt").exists());
         assert!(!project.join("cancelled.txt").exists());
         drop(app);
         std::fs::remove_dir_all(data).unwrap();
@@ -4586,6 +5039,83 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
             .create_file(&project.join("missing"), "file.txt")
             .is_err());
         assert_eq!(app.files, files);
+        drop(app);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn renaming_repository_files_preserves_edits_and_pending_paths() {
+        let data = std::env::temp_dir().join(format!("skyforge-rename-{}", uuid::Uuid::new_v4()));
+        let project = data.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        let project = project.canonicalize().unwrap();
+        let current = project.join("src/current.txt");
+        let other = project.join("other.txt");
+        std::fs::write(&current, "saved text").unwrap();
+        std::fs::write(&other, "other text").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Skyforge::load(&ctx, Some(project.clone()), data.join("state")).unwrap();
+        app.files = vec![current.clone(), other.clone()];
+        app.open_file(current.clone());
+        app.editor.as_mut().unwrap().text = "unsaved edits".into();
+        app.open_file(other.clone());
+        assert!(app.file_decision);
+
+        for name in [
+            "",
+            "  ",
+            ".",
+            "..",
+            "../outside.txt",
+            "nested/file.txt",
+            "bad\\name",
+            "bad\0name",
+        ] {
+            assert!(
+                app.rename_file(&current, name).is_err(),
+                "Accepted {name:?}"
+            );
+        }
+        assert!(app.rename_file(&project.join("src"), "renamed").is_err());
+        let outside = data.join("outside.txt");
+        std::fs::write(&outside, "outside").unwrap();
+        assert!(app.rename_file(&outside, "renamed.txt").is_err());
+        assert!(app
+            .rename_file(&other, "src")
+            .unwrap_err()
+            .contains("already exists"));
+        assert!(app.rename_file(&other, "other.txt").is_ok());
+
+        app.rename_file(&current, "renamed.rs").unwrap();
+        let renamed = project.join("src/renamed.rs");
+        assert!(!current.exists());
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "saved text");
+        assert_eq!(app.editor.as_ref().unwrap().path, renamed);
+        assert_eq!(app.editor.as_ref().unwrap().text, "unsaved edits");
+        assert!(app.editor.as_ref().unwrap().dirty());
+        assert!(app.tree.children["src"].children.contains_key("renamed.rs"));
+        assert!(!app.tree.children["src"]
+            .children
+            .contains_key("current.txt"));
+        assert!(!app.files.contains(&current));
+        app.rename_file(&other, "pending.txt").unwrap();
+        let pending = project.join("pending.txt");
+        assert_eq!(app.pending_file.as_ref(), Some(&pending));
+        assert!(app.file_decision);
+        assert!(app.rename_file(&pending, "pending.txt").is_ok());
+        std::fs::write(project.join("taken.txt"), "keep me").unwrap();
+        assert!(app
+            .rename_file(&pending, "taken.txt")
+            .unwrap_err()
+            .contains("already exists"));
+        assert_eq!(
+            std::fs::read_to_string(project.join("taken.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(pending.exists());
+        assert!(app.save_file());
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "unsaved edits");
+        assert!(!current.exists());
         drop(app);
         std::fs::remove_dir_all(data).unwrap();
     }
