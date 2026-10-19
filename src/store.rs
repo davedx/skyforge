@@ -208,7 +208,9 @@ impl Store {
                 }
             }
         }
-        Ok(Self { conn, path })
+        let store = Self { conn, path };
+        store.init_wakes()?;
+        Ok(store)
     }
 
     pub fn save(&self, w: &Workstream) -> Result<()> {
@@ -511,11 +513,11 @@ impl Store {
         }
         // Read recent conversational messages directly from SQLite, including closed tabs.
         // The submitted user message is already present and is supplied separately below.
-        let mut transcript: Vec<(String,String)> = self.conn.prepare("SELECT role,body FROM messages WHERE workstream=?1 AND role IN ('You','Agent') ORDER BY id DESC LIMIT 51")?
+        let mut transcript: Vec<(String,String)> = self.conn.prepare("SELECT role,body FROM messages WHERE workstream=?1 AND role IN ('You','Agent','Wake') ORDER BY id DESC LIMIT 51")?
             .query_map([&w.id], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         if transcript
             .first()
-            .is_some_and(|(role, body)| role == "You" && body == &w.draft)
+            .is_some_and(|(role, body)| matches!(role.as_str(), "You" | "Wake") && body == &w.draft)
         {
             transcript.remove(0);
         }

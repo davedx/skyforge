@@ -182,6 +182,7 @@ pub fn agent_command(config: &AgentConfig, w: &Workstream) -> Command {
             cmd.args(["--resume", session]);
         }
         if !thinker {
+            add_wake_tools(&mut cmd, w, true);
             cmd.current_dir(&w.project);
         }
         return cmd;
@@ -270,6 +271,9 @@ pub fn agent_command(config: &AgentConfig, w: &Workstream) -> Command {
             cmd.current_dir(profile);
         }
     }
+    if !thinker {
+        add_wake_tools(&mut cmd, w, false);
+    }
     if let Some(session) = w.session.as_ref().filter(|_| !thinker) {
         cmd.arg("resume").arg(session);
     }
@@ -281,6 +285,37 @@ pub fn agent_command(config: &AgentConfig, w: &Workstream) -> Command {
         cmd.current_dir(&w.project);
     }
     cmd
+}
+
+fn add_wake_tools(cmd: &mut Command, w: &Workstream, claude: bool) {
+    let Some(endpoint) = &w.delegation_endpoint else {
+        return;
+    };
+    let args = serde_json::json!([
+        "--wake-tools",
+        w.id,
+        w.invocation_turn.as_deref().unwrap_or(""),
+        serde_json::to_string(endpoint).unwrap()
+    ]);
+    let executable = std::env::current_exe().unwrap();
+    if claude {
+        cmd.args([
+            "--mcp-config",
+            &serde_json::json!({"mcpServers":{"harness_wakes":{"command":executable,"args":args}}})
+                .to_string(),
+        ]);
+        cmd.args(["--allowedTools", "mcp__harness_wakes__*"]);
+    } else {
+        cmd.args([
+            "-c",
+            &format!(
+                "mcp_servers.harness_wakes.command={}",
+                serde_json::to_string(&executable).unwrap()
+            ),
+        ]);
+        cmd.args(["-c", &format!("mcp_servers.harness_wakes.args={args}")]);
+        cmd.args(["-c", "mcp_servers.harness_wakes.required=true"]);
+    }
 }
 
 pub fn start_agent(
@@ -314,13 +349,17 @@ pub fn start_agent(
 }
 
 fn agent_prompt(w: &Workstream, restart_available: bool) -> Result<String, String> {
-    let draft = if w.mode == crate::store::Mode::Thinker {
+    let mut draft = if w.mode == crate::store::Mode::Thinker {
         format!("{}\n\nCurrent user message:\n{}", w.context, w.draft)
     } else if restart_available {
         format!("{}\n\n[Skyforge integration]\nFor user-requested Skyforge restarts, run `\"$HARNESS_EXECUTABLE\" --request-restart`. Skyforge restarts itself after all active runs finish. Finish your task and response normally before exiting.", w.draft)
     } else {
         w.draft.clone()
     };
+    if w.delegation_endpoint.is_some() {
+        draft.push_str("\n\n[Skyforge wake timers]\n");
+        draft.push_str(crate::wakes::INSTRUCTIONS);
+    }
     if !is_claude(&w.model) {
         return Ok(draft);
     }
@@ -809,6 +848,60 @@ pub fn find_claude() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_cli_wake_tools_are_scoped_and_preserve_read_only_permissions() {
+        let mut w = Workstream::new(std::path::Path::new("/tmp"));
+        w.invocation_turn = Some("trusted-turn".into());
+        w.delegation_endpoint = Some(crate::delegation_ipc::Endpoint {
+            address: "127.0.0.1:12345".parse().unwrap(),
+            token: "test-capability".into(),
+        });
+        w.session = Some("existing-session".into());
+        let config = AgentConfig {
+            binary: "codex".into(),
+            claude_binary: "claude".into(),
+            local: Default::default(),
+            search: false,
+            writable: false,
+        };
+        let command = agent_command(&config, &w);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|a| a == ["--sandbox", "read-only"]));
+        let raw = args
+            .iter()
+            .find_map(|a| a.strip_prefix("mcp_servers.harness_wakes.args="))
+            .unwrap();
+        let tool_args: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(tool_args[0], "--wake-tools");
+        assert_eq!(tool_args[1], w.id);
+        assert_eq!(tool_args[2], "trusted-turn");
+        assert!(args.windows(2).any(|a| a == ["resume", "existing-session"]));
+        assert!(agent_prompt(&w, false)
+            .unwrap()
+            .contains(crate::wakes::INSTRUCTIONS));
+        w.model = "claude:sonnet".into();
+        let command = agent_command(&config, &w);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|a| a == ["--tools", "Read,Glob,Grep,WebSearch,WebFetch"]));
+        assert!(args
+            .windows(2)
+            .any(|a| a == ["--permission-mode", "dontAsk"]));
+        assert!(args
+            .windows(2)
+            .any(|a| a == ["--allowedTools", "mcp__harness_wakes__*"]));
+        let raw = args.windows(2).find(|a| a[0] == "--mcp-config").unwrap();
+        let config: Value = serde_json::from_str(&raw[1]).unwrap();
+        assert_eq!(config["mcpServers"]["harness_wakes"]["args"], tool_args);
+    }
 
     #[test]
     fn local_model_choices_share_one_entry_with_the_configured_default() {

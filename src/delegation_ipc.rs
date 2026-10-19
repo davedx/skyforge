@@ -1,4 +1,4 @@
-//! Per-instance loopback IPC. The GUI owns all handoff persistence and agent startup.
+//! Per-instance loopback IPC for host tools. The GUI owns persistence and agent startup.
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,7 +78,7 @@ impl Host {
                 let result = (|| {
                     let request: WireRequest = read_json(&stream)?;
                     if request.token != token {
-                        return Err("Invalid Skyforge handoff capability.".into());
+                        return Err("Invalid Skyforge host capability.".into());
                     }
                     let (reply, response) = mpsc::channel();
                     tx.try_send(Request {
@@ -88,19 +88,19 @@ impl Host {
                         reply,
                     })
                     .map_err(|_| {
-                        "Skyforge cannot accept a handoff right now. Retry the same brief."
+                        "Skyforge cannot accept a host request right now. Retry with the same arguments."
                             .to_owned()
                     })?;
                     ctx.request_repaint();
                     let deadline = std::time::Instant::now() + TIMEOUT;
                     loop {
                         if stopping.load(Ordering::SeqCst) {
-                            return Err("Skyforge is shutting down. Retry the same brief after reopening it.".into());
+                            return Err("Skyforge is shutting down. Retry with the same arguments after reopening it.".into());
                         }
                         match response.recv_timeout(Duration::from_millis(100)) {
                             Ok(result) => return result,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("Skyforge closed the handoff request. Retry the same brief.".into()),
-                            Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() >= deadline => return Err("Skyforge did not respond in time. The handoff may already exist; retry the same brief.".into()),
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("Skyforge closed the host request. Retry with the same arguments.".into()),
+                            Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() >= deadline => return Err("Skyforge did not respond in time. The request may already have been accepted; retry with the same arguments.".into()),
                             Err(_) => {},
                         }
                     }
@@ -139,10 +139,12 @@ impl Drop for Host {
 
 pub fn call(endpoint: &Endpoint, source: &str, turn: &str, args: &Value) -> Result<String, String> {
     if !endpoint.address.ip().is_loopback() {
-        return Err("Skyforge handoff IPC must be local.".into());
+        return Err("Skyforge host IPC must be local.".into());
     }
     let mut stream = TcpStream::connect_timeout(&endpoint.address, Duration::from_secs(2))
-        .map_err(|e| format!("Cannot reach the Skyforge host: {e}. Reopen Skyforge and send a new Thinker request."))?;
+        .map_err(|e| {
+            format!("Cannot reach the Skyforge host: {e}. Reopen Skyforge and send a new message.")
+        })?;
     stream
         .set_read_timeout(Some(TIMEOUT + Duration::from_secs(2)))
         .map_err(|e| e.to_string())?;
@@ -159,7 +161,7 @@ pub fn call(endpoint: &Endpoint, source: &str, turn: &str, args: &Value) -> Resu
         },
     )?;
     read_json::<Result<String,String>>(&stream)
-        .map_err(|e| format!("Skyforge handoff response was lost: {e}. Retry the same brief; it may already have been accepted."))?
+        .map_err(|e| format!("Skyforge host response was lost: {e}. Retry with the same arguments; the request may already have been accepted."))?
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(stream: &TcpStream) -> Result<T, String> {

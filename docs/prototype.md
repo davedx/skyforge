@@ -41,6 +41,18 @@ The bundle opens the last project. Use **Open project…** to add another direct
 8. Close a tab with **×**. Its history remains discoverable; a running task continues until it finishes or you reopen it and stop it.
 9. Use **Restart** in the status bar to restart after active agent runs finish.
 
+## Wake timers
+
+Agents can schedule one-shot follow-ups with `schedule_wake`, inspect them with `list_wakes`, and cancel them with `cancel_wake`. These tools are available in both Builder and Thinker: Codex and Claude use MCP; DeepSeek and other OpenAI-compatible models use the same service through function calling.
+
+For example, ask an agent: “Check this job again in an hour, then continue here.” The scheduling tool takes `request_id`, `instructions`, and exactly one of `delay_seconds` (1 second to 365 days) or `at` (an RFC3339 timestamp with a timezone). Reusing the same request ID and arguments within a turn returns the original timer instead of creating a duplicate.
+
+Scheduling returns immediately. The agent should finish its current turn; Skyforge starts another turn in the same workstream when the timer is due. Builder resumes its provider session; Thinker rebuilds its conversational context. Delivery uses the workstream's current model and current host permissions, waits for any active run in that workstream, and preserves unsent drafts and attachments. The transcript labels scheduled input **WAKE**. A reminder continues existing work and grants no additional user authorization.
+
+Open **Wake timers** in the bottom status bar to see pending timers, open their conversations, or cancel them. Closing a tab or project leaves its timers active. **Stop run** cancels that workstream's pending timers and stops the run. Failed starts remain visible with **Retry wake** and **Cancel timer** controls.
+
+Timers are stored in SQLite and survive closing or restarting Skyforge. Keep Skyforge running and the computer awake for timely delivery; overdue timers run after reopening. Dispatch pauses while restarting or shutting down. If Skyforge closes during dispatch, it marks the timer interrupted for manual inspection/retry rather than automatically repeating potentially started work. Dispatch receipts mean a turn was started, not that its task succeeded. Inspect the conversation before retrying. Wake timers do not wake the computer or run while Skyforge is closed, and recurrence rules are not supported.
+
 ## Restarting Skyforge
 
 Use **Restart** in the bottom status bar. If an agent run is active, the button becomes **Cancel restart** and Skyforge waits for every run, including runs in closed tabs, to finish. You can cancel while waiting. Unsaved file-editor changes offer Save, Discard, or Keep working before closing. Drafts, messages, sessions, open tabs, and the selected tab are retained.
@@ -115,7 +127,7 @@ Skyforge defaults to a palette based on VS Code’s Dark Modern theme: dark gray
 
 New installations store local state in `~/Library/Application Support/Skyforge/` on macOS. If an existing `~/Library/Application Support/Harness/history.sqlite3` is present, Skyforge continues using that directory in place, preserving history, settings, sessions, and absolute attachment paths.
 
-- `history.sqlite3` and SQLite WAL files: workstream metadata, drafts, messages, and settings.
+- `history.sqlite3` and SQLite WAL files: workstream metadata, drafts, messages, settings, and persistent wake timers.
 - `attachments/`: durable copies of attached images.
 
 Set `HARNESS_DATA_DIR` to use a separate data directory for testing. The historical `HARNESS_*` environment variables and internal integration identifiers remain supported for compatibility. SQLite stores conversation history, Thinker projects, and shared / project-scoped Thinker memories. The broader coding-agent memory design remains a future capability.

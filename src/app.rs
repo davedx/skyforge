@@ -61,6 +61,8 @@ pub struct Skyforge {
     tx: SyncSender<Envelope>,
     rx: Receiver<Envelope>,
     delegation_host: crate::delegation_ipc::Host,
+    wakes: Vec<crate::wakes::Wake>,
+    wakes_open: bool,
     repository_watch: Option<crate::repository::RepositoryWatch>,
     files: Vec<PathBuf>,
     tree: FileNode,
@@ -211,6 +213,7 @@ impl Skyforge {
         let (tx, rx) = mpsc::sync_channel(256);
         let projects = store.projects().map_err(|e| e.to_string())?;
         let browse_project = tabs[active].thinker_project.clone();
+        let wakes = store.wakes(None).map_err(|e| e.to_string())?;
         let mut app = Self {
             store,
             tabs,
@@ -220,6 +223,8 @@ impl Skyforge {
             tx,
             rx,
             delegation_host: crate::delegation_ipc::Host::new(ctx.clone())?,
+            wakes,
+            wakes_open: false,
             repository_watch: None,
             runs: HashMap::new(),
             activities: HashMap::new(),
@@ -598,6 +603,16 @@ impl Skyforge {
             let Ok(request) = self.delegation_host.try_recv() else {
                 break;
             };
+            if let Some(name) = request.args["wake_tool"].as_str() {
+                let result = self.handle_wake_tool(
+                    &request.source,
+                    &request.turn,
+                    name,
+                    &request.args["arguments"],
+                );
+                let _ = request.reply.send(result);
+                continue;
+            }
             let result = crate::delegation::create(
                 &request.args,
                 &self.store,
@@ -756,6 +771,7 @@ impl Skyforge {
             }
             self.history_dirty = true;
         }
+        self.process_wakes(ctx);
         if !self.runs.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
@@ -764,6 +780,186 @@ impl Skyforge {
             .is_some_and(|t| t.elapsed() >= Duration::from_millis(400))
         {
             self.save_active();
+        }
+    }
+
+    fn refresh_wakes(&mut self) {
+        match self.store.wakes(None) {
+            Ok(wakes) => self.wakes = wakes,
+            Err(error) => self.notice = Some(format!("Could not read wake timers: {error}")),
+        }
+    }
+
+    fn handle_wake_tool(
+        &mut self,
+        source: &str,
+        turn: &str,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<String, String> {
+        // A retained MCP process cannot create timers after its run has ended or stopped.
+        if !self
+            .runs
+            .get(source)
+            .is_some_and(|run| !run.cancelled.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err("The originating Skyforge run is no longer active.".into());
+        }
+        let result = crate::wakes::handle(&self.store, source, turn, name, args);
+        self.refresh_wakes();
+        result
+    }
+
+    fn process_wakes(&mut self, ctx: &egui::Context) {
+        if self.allow_quit || self.quit_decision || self.restart.requested {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let due: Vec<_> = self
+            .wakes
+            .iter()
+            .filter(|wake| {
+                wake.status == "pending" && wake.due_ms <= now && !self.busy(&wake.workstream)
+            })
+            .take(16)
+            .cloned()
+            .collect();
+        for wake in due {
+            if self.busy(&wake.workstream) {
+                continue;
+            }
+            match self.store.claim_wake(&wake, now) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    self.notice = Some(format!("Could not claim wake: {error}"));
+                    continue;
+                }
+            }
+            let result = (|| -> Result<(), String> {
+                let index = match self.tabs.iter().position(|tab| tab.id == wake.workstream) {
+                    Some(index) => index,
+                    None => {
+                        let tab = self
+                            .store
+                            .load(&wake.workstream)
+                            .map_err(|e| e.to_string())?;
+                        self.tabs.push(tab);
+                        self.tabs.len() - 1
+                    }
+                };
+                let mut submitted = self.tabs[index].clone();
+                // Snapshot the scheduled prompt, never replacing the user's live draft or attachments.
+                submitted.draft = wake.prompt();
+                submitted.attachments.clear();
+                submitted.invocation_turn = Some(format!("wake-{}", wake.id));
+                let mut config = self.config.clone();
+                config.local.retry = false;
+                self.launch_submitted(index, &submitted, config, ctx)
+            })();
+            if let Err(error) = self
+                .store
+                .wake_dispatched(&wake.id, result.as_ref().err().map(String::as_str))
+            {
+                self.notice = Some(format!("Could not save wake dispatch: {error}"));
+            }
+            if let Err(error) = result {
+                self.notice = Some(format!("Wake timer could not start: {error}"));
+            }
+            if self.tabs[self.active].id == wake.workstream && !self.history_context {
+                match self.store.messages(&wake.workstream, None) {
+                    Ok(messages) => self.messages = messages,
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
+            self.refresh_wakes();
+            self.history_dirty = true;
+        }
+        // Schedule the next GUI wake without a sleeping agent or a polling worker. A bounded
+        // recheck also handles wall-clock adjustments and machines waking from system sleep.
+        if let Some(delay) = self
+            .wakes
+            .iter()
+            .filter(|wake| wake.status == "pending")
+            .map(|wake| {
+                if wake.due_ms <= now && self.busy(&wake.workstream) {
+                    30_000
+                } else {
+                    wake.due_ms.saturating_sub(now).clamp(1, 30_000) as u64
+                }
+            })
+            .min()
+        {
+            ctx.request_repaint_after(Duration::from_millis(delay));
+        }
+    }
+
+    fn wake_dialog(&mut self, ctx: &egui::Context) {
+        if !self.wakes_open {
+            return;
+        }
+        let mut open = true;
+        let mut cancel = None;
+        let mut retry = None;
+        let mut show = None;
+        egui::Window::new("Wake timers").open(&mut open).default_width(520.0).show(ctx, |ui| {
+            ui.label("One-shot reminders resume their conversation. Keep Skyforge running and your computer awake. Closing a tab keeps its timers; Stop run cancels its pending timers.");
+            if self.wakes.is_empty() { ui.label("No pending timers."); }
+            egui::ScrollArea::vertical().max_height(450.0).show(ui, |ui| {
+                for wake in &self.wakes {
+                    ui.push_id(&wake.id, |ui| {
+                        ui.separator();
+                        let title = self.tabs.iter().find(|w| w.id == wake.workstream).map(|w| w.title.clone())
+                            .or_else(|| self.store.load(&wake.workstream).ok().map(|w| w.title)).unwrap_or_else(|| wake.workstream.clone());
+                        if ui.link(title).clicked() { show = Some(wake.workstream.clone()); }
+                        let due = chrono::DateTime::from_timestamp_millis(wake.due_ms).map(|t| t.with_timezone(&chrono::Local).format("%d %b %Y %H:%M:%S %:z").to_string()).unwrap_or_default();
+                        let status = if wake.status == "pending" && self.busy(&wake.workstream) && wake.due_ms <= chrono::Utc::now().timestamp_millis() { "waiting for active run" } else { &wake.status };
+                        ui.label(format!("{due} · {status}"));
+                        ui.label(&wake.instructions);
+                        if let Some(error) = &wake.error { ui.label(RichText::new(error).color(Color32::RED)); }
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Cancel timer").clicked() { cancel = Some((wake.workstream.clone(),wake.id.clone())); }
+                            if wake.status != "pending" && ui.small_button("Retry wake").clicked() { retry = Some(wake.id.clone()); }
+                        });
+                    });
+                }
+            });
+        });
+        self.wakes_open = open;
+        let changed = cancel.is_some() || retry.is_some();
+        let result = if let Some((source, id)) = cancel {
+            self.store.cancel_wake(&source, &id)
+        } else if let Some(id) = retry {
+            self.store.retry_wake(&id)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            self.notice = Some(error.to_string());
+        }
+        if changed {
+            self.refresh_wakes();
+            ctx.request_repaint();
+        }
+        if let Some(id) = show {
+            let index = if let Some(index) = self.tabs.iter().position(|w| w.id == id) {
+                Some(index)
+            } else {
+                match self.store.load(&id) {
+                    Ok(w) => {
+                        self.tabs.push(w);
+                        Some(self.tabs.len() - 1)
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.to_string());
+                        None
+                    }
+                }
+            };
+            if let Some(index) = index {
+                self.tabs[index].opened = true;
+                self.select(index, ctx);
+            }
         }
     }
 
@@ -894,6 +1090,13 @@ impl Skyforge {
     }
 
     fn stop(&mut self) {
+        if let Err(error) = self
+            .store
+            .cancel_workstream_wakes(&self.tabs[self.active].id)
+        {
+            self.notice = Some(format!("Could not cancel wake timers: {error}"));
+        }
+        self.refresh_wakes();
         if let Some(run) = self.runs.get(&self.tabs[self.active].id) {
             run.cancel();
             self.tabs[self.active].status = "Stopping".into();
@@ -913,11 +1116,11 @@ impl Skyforge {
         ctx: &egui::Context,
     ) -> Result<(), String> {
         let mut submitted = w.clone();
+        submitted.delegation_endpoint = Some(self.delegation_host.endpoint());
+        if submitted.invocation_turn.is_none() {
+            submitted.invocation_turn = Some(uuid::Uuid::new_v4().to_string());
+        }
         if submitted.mode == Mode::Thinker {
-            submitted.delegation_endpoint = Some(self.delegation_host.endpoint());
-            if submitted.invocation_turn.is_none() {
-                submitted.invocation_turn = Some(uuid::Uuid::new_v4().to_string());
-            }
             let directory = self.thinker_directory(submitted.thinker_project.as_deref());
             if self
                 .projects
@@ -997,6 +1200,20 @@ impl Skyforge {
                 .submission(&current.id)
                 .map_err(|e| e.to_string())?
                 .ok_or("No saved request to retry.")?;
+            // Both retry controls must consume the same timer. Otherwise retrying a saved
+            // request could start it while leaving another retry available in the timer list.
+            if let Some(id) = submitted
+                .invocation_turn
+                .as_deref()
+                .and_then(|turn| turn.strip_prefix("wake-"))
+            {
+                if self.wakes.iter().any(|wake| wake.id == id) {
+                    self.store.retry_wake(id).map_err(|e| e.to_string())?;
+                    self.refresh_wakes();
+                    ctx.request_repaint();
+                    return Ok(());
+                }
+            }
             if runner::provider(&submitted.model) == runner::provider(&current.model) {
                 submitted.session = current.session.clone();
             }
@@ -1306,10 +1523,18 @@ impl Skyforge {
                         self.restart.requested = !self.restart.requested;
                         self.restart_decision = false;
                     }
+                    if ui
+                        .small_button(format!("Wake timers ({})", self.wakes.len()))
+                        .clicked()
+                    {
+                        self.wakes_open = true;
+                    }
                     let running = self.runs.len();
                     ui.label(
                         RichText::new(if self.restart.requested {
                             format!("Restart queued · waiting for {running} run(s)")
+                        } else if running == 0 && self.wakes.iter().any(|w| w.status == "pending") {
+                            "Waiting for wake timers".into()
                         } else if running == 0 {
                             "Ready".into()
                         } else {
@@ -2443,9 +2668,18 @@ impl Skyforge {
                 "local_context_windows",
                 serde_json::to_string(&self.config.local.context_windows).unwrap_or_default(),
             ),
-            ("local_output_limits", serde_json::to_string(&self.config.local.output_limits).unwrap_or_default()),
-            ("local_model_capabilities", serde_json::to_string(&self.config.local.model_capabilities).unwrap_or_default()),
-            ("local_reasoning_replay", serde_json::to_string(&self.config.local.reasoning_replay).unwrap_or_default()),
+            (
+                "local_output_limits",
+                serde_json::to_string(&self.config.local.output_limits).unwrap_or_default(),
+            ),
+            (
+                "local_model_capabilities",
+                serde_json::to_string(&self.config.local.model_capabilities).unwrap_or_default(),
+            ),
+            (
+                "local_reasoning_replay",
+                serde_json::to_string(&self.config.local.reasoning_replay).unwrap_or_default(),
+            ),
             ("web_search", self.config.search.to_string()),
             ("writable", self.config.writable.to_string()),
         ]
@@ -2666,6 +2900,7 @@ impl Skyforge {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.wake_dialog(ctx);
         self.file_find_dialog(ctx);
         self.thinker_dialogs(ctx);
         if self.restart_decision {
@@ -2899,8 +3134,10 @@ impl eframe::App for Skyforge {
             self.model_discovery = None;
             match result {
                 Ok(catalog) => {
-                    self.model_discovery_status =
-                        format!("{} server models available in the composer.", catalog.ids.len());
+                    self.model_discovery_status = format!(
+                        "{} server models available in the composer.",
+                        catalog.ids.len()
+                    );
                     self.config.local.apply_catalog(catalog);
                     self.persist_settings();
                     self.model_choices = runner::model_choices(&self.config.local);
@@ -2988,6 +3225,7 @@ impl eframe::App for Skyforge {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.allow_quit = true; // Draining events must never dispatch timers during shutdown.
         self.delegation_host.shutdown();
         while self.delegation_host.try_recv().is_ok() {}
         self.save_active();
@@ -3240,6 +3478,252 @@ fn highlight_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_timer_window_retries_and_cancels_failed_timers() {
+        fn text_rect(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| text_rect(s, label)),
+                _ => None,
+            }
+        }
+        let (root, ctx, mut app, source, _) = handoff_fixture();
+        crate::wakes::handle(&app.store,&source.id,"host-turn","schedule_wake",&serde_json::json!({"request_id":"ui","instructions":"Check the deployment","delay_seconds":1})).unwrap();
+        app.store
+            .conn
+            .execute(
+                "UPDATE wake_timers SET status='failed',error='Backend unavailable'",
+                [],
+            )
+            .unwrap();
+        app.refresh_wakes();
+        app.wakes_open = true;
+        let frame = |app: &mut Skyforge, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.wake_dialog(ctx),
+            )
+        };
+        let click = |app: &mut Skyforge, label: &str| {
+            frame(app, vec![]);
+            let output = frame(app, vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|s| text_rect(&s.shape, label))
+                .unwrap_or_else(|| panic!("Missing timer control: {label}"))
+                .center();
+            frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            frame(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        assert!(output
+            .shapes
+            .iter()
+            .any(|s| text_rect(&s.shape, "Backend unavailable").is_some()));
+        click(&mut app, "Retry wake");
+        assert_eq!(app.wakes[0].status, "pending");
+        click(&mut app, "Cancel timer");
+        assert!(app.wakes.is_empty());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wake_waits_for_busy_run_preserves_draft_and_resumes_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, ctx, mut app, _, _) = handoff_fixture();
+        let executable = root.join("wake-fixture");
+        std::fs::write(&executable, r#"#!/bin/sh
+printf '%s\n' "$@" > wake-arguments.txt
+printf 'start\n' >> wake-starts.txt
+cat > wake-prompt.txt
+printf '%s\n' '{"type":"thread.started","thread_id":"resumed-session"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_message","text":"Checked the job."}}'
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        app.config.binary = executable.to_string_lossy().into();
+        app.config.writable = false;
+        let index = app.active;
+        app.tabs[index].session = Some("existing-session".into());
+        app.tabs[index].draft = "Unsent user draft".into();
+        app.tabs[index].attachments = vec!["unsent-attachment.png".into()];
+        let mut source = app.tabs[index].clone();
+        source.invocation_turn = Some("host-turn".into());
+        app.store.save_submission(&source).unwrap();
+        app.runs.insert(
+            source.id.clone(),
+            RunHandle {
+                cancelled: Default::default(),
+                join: None,
+            },
+        );
+        let request = serde_json::json!({"wake_tool":"schedule_wake","arguments":{"request_id":"poll","instructions":"Check the background job","delay_seconds":3600}});
+        let receipt = handoff_via_ipc(&mut app, &ctx, &source, &request);
+        assert_eq!(receipt["status"], "pending");
+        let replay = handoff_via_ipc(&mut app, &ctx, &source, &request);
+        assert_eq!(replay["id"], receipt["id"]);
+        assert_eq!(app.wakes.len(), 1);
+        app.store
+            .conn
+            .execute("UPDATE wake_timers SET due_ms=0", [])
+            .unwrap();
+        app.refresh_wakes();
+        app.process_events(&ctx);
+        assert_eq!(app.wakes[0].status, "pending");
+        assert!(!root.join("wake-starts.txt").exists());
+        app.runs.remove(&source.id);
+        app.process_events(&ctx);
+        assert!(app.busy(&source.id));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.busy(&source.id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.process_events(&ctx);
+        }
+        assert!(!app.busy(&source.id));
+        for _ in 0..3 {
+            app.process_events(&ctx);
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("wake-starts.txt")).unwrap(),
+            "start\n"
+        );
+        let args = std::fs::read_to_string(root.join("wake-arguments.txt")).unwrap();
+        assert!(args.contains("resume\nexisting-session\n"));
+        assert!(args.contains("mcp_servers.harness_wakes"));
+        assert!(args.contains("read-only"));
+        let prompt = std::fs::read_to_string(root.join("wake-prompt.txt")).unwrap();
+        assert!(prompt.contains("Check the background job"));
+        assert!(!prompt.contains("Unsent user draft"));
+        assert_eq!(app.tabs[index].draft, "Unsent user draft");
+        assert_eq!(app.tabs[index].attachments, vec!["unsent-attachment.png"]);
+        assert_eq!(app.tabs[index].session.as_deref(), Some("resumed-session"));
+        let stored = app.store.load(&source.id).unwrap();
+        assert_eq!(stored.draft, "Unsent user draft");
+        assert_eq!(stored.attachments, app.tabs[index].attachments);
+        assert_eq!(app.messages.iter().filter(|m| m.role == "Wake").count(), 1);
+        assert!(app.wakes.is_empty());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overdue_closed_workstream_recovers_and_failed_dispatch_can_be_cancelled() {
+        let (root, ctx, app, source, _) = handoff_fixture();
+        crate::wakes::handle(&app.store,&source.id,"host-turn","schedule_wake",&serde_json::json!({"request_id":"recover","instructions":"Continue conversation","delay_seconds":1})).unwrap();
+        app.store
+            .conn
+            .execute("UPDATE wake_timers SET due_ms=0", [])
+            .unwrap();
+        // Use a local model with an invalid host: startup fails without any network request.
+        let mut w = source.clone();
+        w.model = crate::local::MODEL_ID.into();
+        app.store.save(&w).unwrap();
+        app.store.set_setting("local_host", "not a URL").unwrap();
+        drop(app);
+        let mut app = Skyforge::load(&ctx, Some(root.clone()), root.join("state")).unwrap();
+        app.config.local.host = "not a URL".into();
+        assert_eq!(app.wakes.len(), 1);
+        let active = app.tabs[app.active].id.clone();
+        app.process_events(&ctx);
+        assert_eq!(app.tabs[app.active].id, active);
+        assert_eq!(app.wakes[0].status, "failed");
+        assert!(!app.busy(&source.id));
+        assert!(!app.tabs.iter().find(|w| w.id == source.id).unwrap().opened);
+        let wake = app.wakes[0].clone();
+        app.active = app.tabs.iter().position(|w| w.id == source.id).unwrap();
+        app.retry(&ctx); // The saved-request retry also requeues the same timer.
+        assert!(!app.busy(&source.id));
+        assert_eq!(app.wakes[0].status, "pending");
+        app.restart.requested = true;
+        app.process_events(&ctx);
+        assert_eq!(app.wakes[0].status, "pending");
+        app.restart.requested = false;
+        app.allow_quit = true;
+        app.process_events(&ctx);
+        assert_eq!(app.wakes[0].status, "pending");
+        app.allow_quit = false;
+        app.process_events(&ctx);
+        assert_eq!(app.wakes[0].status, "failed");
+        assert_eq!(
+            app.store
+                .messages(&source.id, None)
+                .unwrap()
+                .iter()
+                .filter(|m| m.role == "Wake")
+                .count(),
+            1
+        );
+        app.store.cancel_wake(&source.id, &wake.id).unwrap();
+        app.refresh_wakes();
+        assert!(app.wakes.is_empty());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stop_cancels_pending_timers_and_rejects_late_tool_calls() {
+        let (root, ctx, mut app, _, _) = handoff_fixture();
+        let mut source = app.tabs[app.active].clone();
+        source.invocation_turn = Some("host-turn".into());
+        app.store.save_submission(&source).unwrap();
+        let args = serde_json::json!({"request_id":"stop","instructions":"Check job","delay_seconds":3600});
+        assert!(app
+            .handle_wake_tool(&source.id, "host-turn", "schedule_wake", &args)
+            .is_err());
+        app.runs.insert(
+            source.id.clone(),
+            RunHandle {
+                cancelled: Default::default(),
+                join: None,
+            },
+        );
+        app.handle_wake_tool(&source.id, "host-turn", "schedule_wake", &args)
+            .unwrap();
+        assert_eq!(app.wakes.len(), 1);
+        app.stop();
+        assert!(app.wakes.is_empty());
+        assert!(app
+            .handle_wake_tool(&source.id, "host-turn", "schedule_wake", &args)
+            .is_err());
+        app.runs.clear();
+        app.process_events(&ctx);
+        assert!(app.wakes.is_empty());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn handoff_fixture() -> (
         PathBuf,

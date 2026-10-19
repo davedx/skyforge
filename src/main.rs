@@ -11,9 +11,21 @@ mod runner;
 mod store;
 mod theme;
 mod thinker;
+mod wakes;
 
 fn main() -> eframe::Result<()> {
     let argument = std::env::args_os().nth(1);
+    if argument.as_deref().is_some_and(|a| a == "--wake-tools") {
+        let result = (|| -> Result<(), String> {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            if args.len() != 3 {
+                return Err("Missing wake tool configuration".into());
+            }
+            let endpoint = serde_json::from_str(&args[2]).map_err(|e| e.to_string())?;
+            wakes::serve(&args[0], &args[1], &endpoint)
+        })();
+        return result.map_err(|e| eframe::Error::AppCreation(Box::new(std::io::Error::other(e))));
+    }
     if argument.as_deref().is_some_and(|a| a == "--thinker-tools") {
         let args: Vec<_> = std::env::args_os().skip(2).collect();
         if args.len() != 6 {

@@ -272,9 +272,18 @@ pub fn load(store: &crate::store::Store, project: &Path) -> Config {
                     "local_context_windows",
                     serde_json::to_string(&seed.context_windows).unwrap_or_default(),
                 ),
-                ("local_output_limits", serde_json::to_string(&seed.output_limits).unwrap_or_default()),
-                ("local_model_capabilities", serde_json::to_string(&seed.model_capabilities).unwrap_or_default()),
-                ("local_reasoning_replay", serde_json::to_string(&seed.reasoning_replay).unwrap_or_default()),
+                (
+                    "local_output_limits",
+                    serde_json::to_string(&seed.output_limits).unwrap_or_default(),
+                ),
+                (
+                    "local_model_capabilities",
+                    serde_json::to_string(&seed.model_capabilities).unwrap_or_default(),
+                ),
+                (
+                    "local_reasoning_replay",
+                    serde_json::to_string(&seed.reasoning_replay).unwrap_or_default(),
+                ),
             ]
             .iter()
             .all(|(k, v)| store.set_setting(k, v).is_ok());
@@ -295,9 +304,18 @@ pub fn load(store: &crate::store::Store, project: &Path) -> Config {
             .setting("local_context_windows")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default(),
-        output_limits: store.setting("local_output_limits").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
-        model_capabilities: store.setting("local_model_capabilities").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
-        reasoning_replay: store.setting("local_reasoning_replay").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+        output_limits: store
+            .setting("local_output_limits")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        model_capabilities: store
+            .setting("local_model_capabilities")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        reasoning_replay: store
+            .setting("local_reasoning_replay")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
         history_dir: store.path.with_file_name("local-sessions"),
         available_models: vec![],
         retry: false,
@@ -476,11 +494,15 @@ fn run(
     } else {
         messages.insert(0, system);
     }
-    let draft = if w.mode == crate::store::Mode::Thinker {
+    let mut draft = if w.mode == crate::store::Mode::Thinker {
         format!("{}\n\nCurrent user message:\n{}", w.context, w.draft)
     } else {
         w.draft.clone()
     };
+    if w.delegation_endpoint.is_some() {
+        draft.push_str("\n\n[Skyforge wake timers]\n");
+        draft.push_str(crate::wakes::INSTRUCTIONS);
+    }
     let mut content = vec![json!({"type":"text","text":draft})];
     for path in &w.attachments {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -501,6 +523,9 @@ fn run(
     let run_id = uuid::Uuid::new_v4().to_string();
     let mut repair_attempts = 0;
     let mut definitions = tools(writable, restart.is_some() && !config.local.is_deepseek());
+    if w.delegation_endpoint.is_some() {
+        definitions.extend(crate::wakes::definitions().into_iter().map(|tool| json!({"type":"function","function":{"name":tool["name"],"description":tool["description"],"parameters":tool["inputSchema"]}})));
+    }
     if w.mode == crate::store::Mode::Thinker {
         definitions.extend(crate::thinker::tool_definitions().into_iter().map(|tool| json!({"type":"function","function":{"name":tool["name"],"description":tool["description"],"parameters":tool["inputSchema"]}})));
         if config.search {
@@ -619,6 +644,19 @@ fn run(
             )
             .map_err(|e| format!("Invalid tool arguments: {e}"))
             .and_then(|args| {
+                if crate::wakes::is_tool(name) {
+                    return crate::wakes::call(
+                        w.delegation_endpoint
+                            .as_ref()
+                            .ok_or("Missing Skyforge timer endpoint")?,
+                        &w.id,
+                        w.invocation_turn
+                            .as_deref()
+                            .ok_or("Missing Skyforge turn identity")?,
+                        name,
+                        &args,
+                    );
+                }
                 if w.mode == crate::store::Mode::Thinker && name == "spawn_builder_workstream" {
                     return crate::delegation_ipc::call(
                         w.delegation_endpoint
@@ -1497,7 +1535,9 @@ fn http_request(
     let body = temp.0.join("request.json");
     let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let mut input = format!("url = \"{}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Content-Type: application/json\"\n", quote(url), quote(&config.api_key));
-    let request_id = request_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let request_id = request_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let log = |direction: &str, body: &str, status: Option<&str>| {
         if payload.is_some() {
             if let Err(error) = log_http_json(config, &request_id, direction, url, body, status) {
@@ -2077,8 +2117,15 @@ mod tests {
         let fixture = thread::spawn(move || {
             let (mut socket, _) = server.accept().unwrap();
             let first = receive(&mut socket);
-            assert_eq!(first["messages"][0]["content"], "You are a helpful software engineer assistant.");
-            assert!(first["tools"].as_array().unwrap().iter().all(|tool| tool["function"]["name"] != "request_restart"));
+            assert_eq!(
+                first["messages"][0]["content"],
+                "You are a helpful software engineer assistant."
+            );
+            assert!(first["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool["function"]["name"] != "request_restart"));
             assert_eq!(first["max_tokens"], 8192);
             respond(
                 &mut socket,
@@ -2098,7 +2145,10 @@ mod tests {
             );
             let (mut socket, _) = server.accept().unwrap();
             let third = receive(&mut socket);
-            assert_eq!(third["messages"][0]["content"], "You are a helpful software engineer assistant.");
+            assert_eq!(
+                third["messages"][0]["content"],
+                "You are a helpful software engineer assistant."
+            );
             assert_eq!(
                 third["messages"][2]["reasoning_content"],
                 "private tool reasoning"
@@ -2396,10 +2446,8 @@ mod tests {
             assert_eq!(record["model"], cfg.local.model);
             assert_eq!(record["workstream_id"], w.id);
             assert_eq!(record["run_id"], responses[0]["run_id"]);
-            assert!(records
-                .iter()
-                .any(|wire| wire["direction"] == "response"
-                    && wire["request_id"] == record["request_id"]));
+            assert!(records.iter().any(|wire| wire["direction"] == "response"
+                && wire["request_id"] == record["request_id"]));
         }
         assert_eq!(executions[1]["request_id"], responses[0]["request_id"]);
         assert!(!log.contains("fixture-key"));
@@ -2972,6 +3020,130 @@ mod tests {
     }
 
     #[test]
+    fn wake_tools_use_the_same_host_service_for_deepseek_and_other_models() {
+        use std::net::TcpListener;
+        for model in ["deepseek-chat", "fixture-qwen"] {
+            let temp = TempDir::new().unwrap();
+            let root = temp.0.canonicalize().unwrap();
+            let store = crate::store::Store::open(root.join("history.sqlite3")).unwrap();
+            let mut w = Workstream::new(&root);
+            w.model = MODEL_ID.into();
+            w.draft = "Check later".into();
+            w.invocation_turn = Some("timer-turn".into());
+            store.save(&w).unwrap();
+            store.save_submission(&w).unwrap();
+            let host = crate::delegation_ipc::Host::new(egui::Context::default()).unwrap();
+            w.delegation_endpoint = Some(host.endpoint());
+            let path = store.path.clone();
+            let dispatcher = thread::spawn(move || {
+                let db = crate::store::Store::tool_connection(path).unwrap();
+                for _ in 0..3 {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let request = loop {
+                        match host.try_recv() {
+                            Ok(request) => break request,
+                            Err(_) if Instant::now() < deadline => {
+                                thread::sleep(Duration::from_millis(1))
+                            }
+                            Err(_) => panic!("Missing timer IPC request"),
+                        }
+                    };
+                    let result = crate::wakes::handle(
+                        &db,
+                        &request.source,
+                        &request.turn,
+                        request.args["wake_tool"].as_str().unwrap(),
+                        &request.args["arguments"],
+                    );
+                    request.reply.send(result).unwrap();
+                }
+            });
+            let server = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut cfg = config(&root, format!("http://{}", server.local_addr().unwrap()));
+            cfg.local.model = model.into();
+            let fixture = thread::spawn(move || {
+                let mut timer = String::new();
+                for step in 0..4 {
+                    let (mut socket, _) = server.accept().unwrap();
+                    let request = receive(&mut socket);
+                    for name in ["schedule_wake", "list_wakes", "cancel_wake"] {
+                        assert!(request["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|t| t["function"]["name"] == name));
+                    }
+                    assert!(request["messages"][1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains(crate::wakes::INSTRUCTIONS));
+                    let (name, args) = match step {
+                        0 => (
+                            "schedule_wake",
+                            json!({"request_id":"job","instructions":"Check job","delay_seconds":86400}),
+                        ),
+                        1 => {
+                            let last = request["messages"].as_array().unwrap().last().unwrap();
+                            assert_eq!(last["tool_call_id"], "timer-0");
+                            let receipt: Value =
+                                serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+                            assert_eq!(receipt["status"], "pending");
+                            timer = receipt["id"].as_str().unwrap().into();
+                            ("list_wakes", json!({}))
+                        }
+                        2 => {
+                            let last = request["messages"].as_array().unwrap().last().unwrap();
+                            let timers: Value =
+                                serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+                            assert_eq!(timers[0]["id"], timer);
+                            ("cancel_wake", json!({"id":timer}))
+                        }
+                        _ => {
+                            let last = request["messages"].as_array().unwrap().last().unwrap();
+                            let receipt: Value =
+                                serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+                            assert_eq!(receipt["status"], "cancelled");
+                            respond(
+                                &mut socket,
+                                json!({"role":"assistant","content":"Timer cancelled.","reasoning_content":"Done"}),
+                            );
+                            break;
+                        }
+                    };
+                    respond(
+                        &mut socket,
+                        json!({"role":"assistant","reasoning_content":"Manage the requested timer","tool_calls":[{"id":format!("timer-{step}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}),
+                    );
+                }
+            });
+            run(
+                &cfg,
+                &w,
+                &root,
+                &root.join("session.json"),
+                None,
+                &AtomicBool::new(false),
+                &|_| {},
+            )
+            .unwrap();
+            fixture.join().unwrap();
+            dispatcher.join().unwrap();
+            assert!(store.wakes(None).unwrap().is_empty());
+            let history: Value =
+                serde_json::from_slice(&std::fs::read(root.join("session.json")).unwrap()).unwrap();
+            assert_eq!(
+                history
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["role"] == "tool")
+                    .count(),
+                3
+            );
+        }
+    }
+
+    #[test]
     fn thinker_local_profile_uses_conversation_and_memory_tools_without_editing() {
         let temp = TempDir::new().unwrap();
         let root = temp.0.canonicalize().unwrap();
@@ -3497,7 +3669,10 @@ mod tests {
         let mut cfg = cfg;
         let catalog = discover_models(&cfg.local).unwrap();
         cfg.local.apply_catalog(catalog);
-        assert_eq!(selected_config(&cfg.local, &selection_id("gpt-oss-20b")).output_limit(), 6000);
+        assert_eq!(
+            selected_config(&cfg.local, &selection_id("gpt-oss-20b")).output_limit(),
+            6000
+        );
         assert_eq!(
             cfg.local.available_models,
             vec!["gemma-4-26b-qat-4bit", "gpt-oss-20b"]
