@@ -10,7 +10,8 @@ license = "MIT"
 base64 = "0.23"
 eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "accesskit"] }
 egui_commonmark = "0.20"
-egui_extras = { version = "0.31.1", features = ["syntect", "image", "file"] }
+egui_extras = { version = "0.31.1", features = ["syntect", "image", "file", "svg"] }
+latex-rust = "3.0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

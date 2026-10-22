@@ -4,6 +4,14 @@ use pulldown_cmark::{Alignment, Event, Parser, Tag, TagEnd};
 use std::borrow::Cow;
 use std::ops::Range;
 
+mod math;
+
+#[derive(Default)]
+pub struct Cache {
+    markdown: CommonMarkCache,
+    math: std::rc::Rc<math::Cache>,
+}
+
 struct ListBlock {
     range: Range<usize>,
     start: Option<u64>,
@@ -12,7 +20,9 @@ struct ListBlock {
 
 // Keep the existing renderer for rich content, but give list markers and bodies
 // separate columns. Its inline marker widgets cannot align or indent wrapped text.
-pub fn show(ui: &mut Ui, cache: &mut CommonMarkCache, text: &str) {
+pub fn show(ui: &mut Ui, cache: &mut Cache, text: &str) {
+    let normalized = math::normalize(text);
+    let text = normalized.as_ref();
     let mut cursor = 0;
     for list in lists(text) {
         render(ui, cache, &text[cursor..list.range.start]);
@@ -66,7 +76,7 @@ pub fn show(ui: &mut Ui, cache: &mut CommonMarkCache, text: &str) {
     render(ui, cache, &text[cursor..]);
 }
 
-fn render(ui: &mut Ui, cache: &mut CommonMarkCache, text: &str) {
+fn render(ui: &mut Ui, cache: &mut Cache, text: &str) {
     let mut cursor = 0;
     for table in tables(text) {
         render_markdown(ui, cache, &text[cursor..table.range.start]);
@@ -76,9 +86,15 @@ fn render(ui: &mut Ui, cache: &mut CommonMarkCache, text: &str) {
     render_markdown(ui, cache, &text[cursor..]);
 }
 
-fn render_markdown(ui: &mut Ui, cache: &mut CommonMarkCache, text: &str) {
+fn render_markdown(ui: &mut Ui, cache: &mut Cache, text: &str) {
     if !text.trim().is_empty() {
-        CommonMarkViewer::new().show(ui, cache, &autolink_urls(text));
+        let math_cache = cache.math.clone();
+        let math = move |ui: &mut Ui, source: &str, inline| math_cache.show(ui, source, inline);
+        CommonMarkViewer::new().render_math_fn(Some(&math)).show(
+            ui,
+            &mut cache.markdown,
+            &autolink_urls(text),
+        );
     }
 }
 
@@ -170,7 +186,7 @@ fn tables(text: &str) -> Vec<TableBlock> {
     blocks
 }
 
-fn render_table(ui: &mut Ui, cache: &mut CommonMarkCache, text: &str, table: &TableBlock) {
+fn render_table(ui: &mut Ui, cache: &mut Cache, text: &str, table: &TableBlock) {
     let columns = table.alignments.len();
     if columns == 0 {
         return;
@@ -311,10 +327,10 @@ mod tests {
     fn clicking_a_bare_pr_url_opens_the_browser() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
-        let mut cache = CommonMarkCache::default();
+        let mut cache = Cache::default();
         let url = "https://github.com/example/project/pull/270";
         let source = format!("New PR {url} which fixes #267.");
-        let draw = |ui: &mut Ui, cache: &mut CommonMarkCache| show(ui, cache, &source);
+        let draw = |ui: &mut Ui, cache: &mut Cache| show(ui, cache, &source);
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| draw(ui, &mut cache));
         });
@@ -393,7 +409,7 @@ mod tests {
         for viewport in [900.0, 300.0] {
             let ctx = egui::Context::default();
             crate::theme::apply(&ctx);
-            let mut cache = CommonMarkCache::default();
+            let mut cache = Cache::default();
             for _ in 0..3 {
                 let output = ctx.run(
                     egui::RawInput {
@@ -453,7 +469,7 @@ mod tests {
     fn markers_align_with_first_lines_and_wrapping_keeps_the_body_column() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
-        let mut cache = CommonMarkCache::default();
+        let mut cache = Cache::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,

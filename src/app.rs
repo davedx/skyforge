@@ -6,7 +6,6 @@ use crate::{
     theme::{self, ACCENT, INK, INPUT, LINE, LINK, MUTED, ON_ACCENT, PAPER, PROMPT_SIZE, SIDEBAR},
 };
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextEdit};
-use egui_commonmark::CommonMarkCache;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -80,6 +79,7 @@ pub struct Skyforge {
     pending_file: Option<PathBuf>,
     new_file: Option<NewFile>,
     rename_file: Option<RenameFile>,
+    quick_open: crate::quick_open::QuickOpen,
     repository_find: RepositoryFind,
     pending_search_match: Option<(crate::repository_search::Match, String)>,
     find_open: bool,
@@ -91,12 +91,13 @@ pub struct Skyforge {
     settings_open: bool,
     config: AgentConfig,
     model_choices: Vec<(String, String)>,
+    codex_usage: crate::codex_usage::Usage,
     model_discovery: Option<Receiver<Result<crate::local::ModelCatalog, String>>>,
     model_discovery_due: Option<Instant>,
     model_discovery_status: String,
     draft_changed: Option<Instant>,
     notice: Option<String>,
-    markdown: CommonMarkCache,
+    markdown: crate::markdown::Cache,
     jump_to: Option<i64>,
     history_context: bool,
     follow_tail: bool,
@@ -265,6 +266,7 @@ impl Skyforge {
             pending_file: None,
             new_file: None,
             rename_file: None,
+            quick_open: Default::default(),
             repository_find: RepositoryFind::default(),
             pending_search_match: None,
             find_open: false,
@@ -275,12 +277,13 @@ impl Skyforge {
             reload_decision: false,
             settings_open: false,
             model_choices,
+            codex_usage: Default::default(),
             model_discovery: None,
             model_discovery_due: None,
             model_discovery_status: String::new(),
             draft_changed: None,
             notice: None,
-            markdown: CommonMarkCache::default(),
+            markdown: crate::markdown::Cache::default(),
             jump_to: None,
             history_context: false,
             follow_tail: true,
@@ -602,6 +605,7 @@ impl Skyforge {
         if self.tabs[self.active].mode == Mode::Thinker {
             self.new_file = None;
             self.rename_file = None;
+            self.quick_open = Default::default();
             self.repository_find = RepositoryFind::default();
             self.pending_search_match = None;
             self.repository_watch = None;
@@ -618,6 +622,7 @@ impl Skyforge {
         }
         self.new_file = None;
         self.rename_file = None;
+        self.quick_open = Default::default();
         self.repository_find = RepositoryFind::default();
         self.pending_search_match = None;
         self.files.clear();
@@ -2106,6 +2111,14 @@ impl Skyforge {
 
     fn file_find_shortcut(&mut self, ctx: &egui::Context) {
         if self.tabs[self.active].mode == Mode::Builder
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P))
+        {
+            self.find_open = false;
+            self.repository_find.open = false;
+            self.quick_open.show(ctx);
+            return;
+        }
+        if self.tabs[self.active].mode == Mode::Builder
             && ctx.input_mut(|i| {
                 i.consume_key(
                     egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
@@ -2113,6 +2126,7 @@ impl Skyforge {
                 )
             })
         {
+            self.quick_open.open = false;
             self.find_open = false;
             self.repository_find.open = true;
             self.repository_find.focus = true;
@@ -2125,6 +2139,7 @@ impl Skyforge {
             && self.tabs[self.active].mode == Mode::Builder
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F))
         {
+            self.quick_open.open = false;
             self.repository_find.open = false;
             self.find_open = true;
             self.find_focus = true;
@@ -2743,6 +2758,9 @@ impl Skyforge {
                         });
                 });
                 self.tabs[self.active].model = selection;
+                if runner::provider(&self.tabs[self.active].model) == "codex" {
+                    self.codex_usage.show(ui);
+                }
                 if previous != self.tabs[self.active].model {
                     if thinker {
                         let _ = self
@@ -3230,6 +3248,14 @@ impl Skyforge {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(path) = self.quick_open.dialog(
+            ctx,
+            Path::new(&self.tabs[self.active].project),
+            &self.files,
+            self.scanning,
+        ) {
+            self.open_file(path);
+        }
         self.wake_dialog(ctx);
         self.file_find_dialog(ctx);
         self.repository_find_dialog(ctx);
@@ -3491,6 +3517,11 @@ impl Skyforge {
 
 impl eframe::App for Skyforge {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.codex_usage.update(
+            ctx,
+            &self.config.binary,
+            runner::provider(&self.tabs[self.active].model) == "codex",
+        );
         if let Some(due) = self.model_discovery_due {
             if Instant::now() >= due {
                 self.refresh_local_models(ctx);
@@ -4554,6 +4585,91 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
         drop(retained);
         drop(store);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn quick_open_shortcut_filters_navigates_and_protects_unsaved_edits() {
+        let data =
+            std::env::temp_dir().join(format!("skyforge-quick-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(data.join("src")).unwrap();
+        let data = data.canonicalize().unwrap();
+        let first = data.join("src/alpha.rs");
+        let second = data.join("src/beta.rs");
+        std::fs::write(&first, "alpha").unwrap();
+        std::fs::write(&second, "beta").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Skyforge::load(&ctx, Some(data.clone()), data.join("state")).unwrap();
+        app.files = vec![first.clone(), second.clone()];
+        app.scanning = false;
+        let frame = |app: &mut Skyforge, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1360.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.file_find_shortcut(ctx);
+                    app.editor_ui(ctx);
+                    app.workspace(ctx);
+                    app.dialogs(ctx);
+                },
+            );
+        };
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            modifiers,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![key(egui::Key::P, egui::Modifiers::COMMAND)]);
+        assert!(app.quick_open.open);
+        frame(
+            &mut app,
+            vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+        );
+        frame(&mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(!app.quick_open.open);
+        assert_eq!(app.editor.as_ref().unwrap().path, second);
+
+        app.editor.as_mut().unwrap().text.push_str(" edited");
+        frame(&mut app, vec![key(egui::Key::P, egui::Modifiers::COMMAND)]);
+        frame(
+            &mut app,
+            vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+        );
+        frame(&mut app, vec![egui::Event::Text("ALP".into())]);
+        frame(&mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(!app.quick_open.open);
+        assert!(app.file_decision);
+        assert_eq!(app.pending_file.as_ref(), Some(&first));
+        assert_eq!(app.editor.as_ref().unwrap().text, "beta edited");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "beta");
+        app.file_decision = false;
+        app.pending_file = None;
+
+        frame(&mut app, vec![key(egui::Key::P, egui::Modifiers::COMMAND)]);
+        frame(&mut app, vec![egui::Event::Text("no-match".into())]);
+        frame(&mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(app.quick_open.open);
+        frame(
+            &mut app,
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(!app.quick_open.open);
+        assert_eq!(app.editor.as_ref().unwrap().path, second);
+
+        frame(&mut app, vec![key(egui::Key::P, egui::Modifiers::COMMAND)]);
+        app.tabs[app.active].project = data.join("other").to_string_lossy().into_owned();
+        app.sync_repository_watch(&ctx);
+        assert!(!app.quick_open.open);
+        drop(app);
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
@@ -5935,68 +6051,93 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
         let data = std::env::temp_dir().join(format!("harness-ui-{}", uuid::Uuid::new_v4()));
         let ctx = egui::Context::default();
         let mut app = Skyforge::load(&ctx, Some(std::env::temp_dir()), data.clone()).unwrap();
-        app.tabs[app.active].model = "claude:sonnet".into();
-        for size in [egui::vec2(850.0, 600.0), egui::vec2(1360.0, 900.0)] {
-            let output = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-                    ..Default::default()
-                },
-                |ctx| {
-                    app.toolbar(ctx);
-                    app.sidebar(ctx);
-                    app.workspace(ctx);
-                },
-            );
-            let panel =
-                egui::containers::panel::PanelState::load(&ctx, egui::Id::new("composer_panel"))
-                    .unwrap()
-                    .rect;
-            let centers: Vec<_> = ["+ Image", "Anthropic Claude · Sonnet"]
-                .iter()
-                .map(|label| {
-                    output
+        app.codex_usage = crate::codex_usage::Usage::fixture();
+        for (model, model_label) in [
+            ("claude:sonnet", "Anthropic Claude · Sonnet"),
+            ("", "Codex · Default model"),
+        ] {
+            app.tabs[app.active].model = model.into();
+            for size in [egui::vec2(850.0, 600.0), egui::vec2(1360.0, 900.0)] {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.toolbar(ctx);
+                        app.sidebar(ctx);
+                        app.workspace(ctx);
+                    },
+                );
+                let panel = egui::containers::panel::PanelState::load(
+                    &ctx,
+                    egui::Id::new("composer_panel"),
+                )
+                .unwrap()
+                .rect;
+                let centers: Vec<_> = ["+ Image", model_label]
+                    .iter()
+                    .map(|label| {
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|s| text_rect(&s.shape, label))
+                            .unwrap()
+                            .center()
+                            .y
+                    })
+                    .collect();
+                assert!(
+                    centers.iter().all(|y| (y - centers[0]).abs() <= 1.0),
+                    "Composer controls must share a vertical center: {centers:?}"
+                );
+                for label in ["+ Image", model_label, "Send  ↗"] {
+                    let (clip, rect) = output
                         .shapes
                         .iter()
-                        .find_map(|s| text_rect(&s.shape, label))
-                        .unwrap()
-                        .center()
-                        .y
-                })
-                .collect();
-            assert!(
-                centers.iter().all(|y| (y - centers[0]).abs() <= 1.0),
-                "Composer controls must share a vertical center: {centers:?}"
-            );
-            for label in ["+ Image", "Anthropic Claude · Sonnet", "Send  ↗"] {
-                let (clip, rect) = output
-                    .shapes
-                    .iter()
-                    .find_map(|s| text_rect(&s.shape, label).map(|r| (s.clip_rect, r)))
-                    .unwrap();
-                assert!(
-                    clip.contains_rect(rect),
-                    "{label} must remain visible: {rect:?} in {clip:?}"
-                );
-                assert!(
-                    panel.contains_rect(rect.expand2(egui::vec2(12.0, 8.0))),
-                    "{label} hover must fit inside the panel: {rect:?} in {panel:?}"
-                );
-            }
-            for label in [
-                "Web",
-                "Write",
-                "Preview",
-                "Shell",
-                "YOUR PROMPT",
-                "RUST PROTOTYPE",
-                "Expand ↗",
-                "Shrink ↙",
-            ] {
-                assert!(!output
-                    .shapes
-                    .iter()
-                    .any(|s| text_rect(&s.shape, label).is_some()));
+                        .find_map(|s| text_rect(&s.shape, label).map(|r| (s.clip_rect, r)))
+                        .unwrap();
+                    assert!(
+                        clip.contains_rect(rect),
+                        "{label} must remain visible: {rect:?} in {clip:?}"
+                    );
+                    assert!(
+                        panel.contains_rect(rect.expand2(egui::vec2(12.0, 8.0))),
+                        "{label} hover must fit inside the panel: {rect:?} in {panel:?}"
+                    );
+                }
+                if model.is_empty() {
+                    let usage = output
+                        .shapes
+                        .iter()
+                        .find_map(|s| text_rect(&s.shape, "5h: 61% left · Weekly: 81% left"))
+                        .unwrap();
+                    let model = output
+                        .shapes
+                        .iter()
+                        .find_map(|s| text_rect(&s.shape, model_label))
+                        .unwrap();
+                    assert!(usage.left() > model.right());
+                    assert!(
+                        panel.contains_rect(usage),
+                        "Usage must fit in composer: {usage:?} in {panel:?}"
+                    );
+                }
+                for label in [
+                    "Web",
+                    "Write",
+                    "Preview",
+                    "Shell",
+                    "YOUR PROMPT",
+                    "RUST PROTOTYPE",
+                    "Expand ↗",
+                    "Shrink ↙",
+                ] {
+                    assert!(!output
+                        .shapes
+                        .iter()
+                        .any(|s| text_rect(&s.shape, label).is_some()));
+                }
             }
         }
         drop(app);

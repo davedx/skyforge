@@ -1,10 +1,12 @@
 mod app;
+mod codex_usage;
 mod delegation;
 mod delegation_ipc;
 mod editor;
 mod local;
 mod markdown;
 mod performance;
+mod quick_open;
 mod repository;
 mod repository_search;
 mod research;
