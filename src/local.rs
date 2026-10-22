@@ -1555,6 +1555,7 @@ fn emit_prompt_usage(response: &Value, label: &str, emit: &impl Fn(Event)) {
     });
 }
 
+#[cfg(test)]
 fn request(
     config: &Config,
     payload: &Value,
@@ -2030,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_batches_summaries_and_preserves_saved_history_and_latest_tools() {
+    fn compaction_handoff_preserves_saved_history_and_continues_tools() {
         let temp = TempDir::new().unwrap();
         let root = temp.0.canonicalize().unwrap();
         std::fs::write(root.join("README.md"), "latest file contents").unwrap();
@@ -2050,25 +2051,16 @@ mod tests {
         save_history(&history_path, &history).unwrap();
         let fixture = thread::spawn(move || {
             let (mut socket, _) = server.accept().unwrap();
-            let summary = receive(&mut socket);
-            assert!(summary.get("tools").is_none());
-            let inputs: Vec<String> =
-                serde_json::from_str(summary["messages"][1]["content"].as_str().unwrap()).unwrap();
-            assert_eq!(inputs.len(), 13);
-            assert!(inputs[0].starts_with("Output 0:"));
-            assert!(inputs[3].starts_with("Output 10:"));
-            let lines: Vec<_> = (0..13).map(|i| format!("Concise result {i}")).collect();
-            respond(
-                &mut socket,
-                json!({"role":"assistant", "content":serde_json::to_string(&lines).unwrap()}),
-            );
-            let (mut socket, _) = server.accept().unwrap();
             let request = receive(&mut socket);
             let messages = request["messages"].as_array().unwrap();
-            assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 2);
+            assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 3);
+            assert!(request.get("tools").is_some());
             assert!(!request.to_string().contains("private reasoning"));
-            assert!(!request.to_string().contains(&"x".repeat(3000)));
-            assert!(request.to_string().contains("Concise result 12"));
+            assert!(!request.to_string().contains("Output 16:"));
+            for i in 17..20 {
+                assert!(request.to_string().contains(&format!("Output {i}:")));
+            }
+            assert!(request.to_string().contains("AGENTS.md"));
             respond(
                 &mut socket,
                 json!({"role":"assistant", "tool_calls":[{"id":"latest","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]}),
@@ -2108,49 +2100,6 @@ mod tests {
         assert!(!saved.iter().any(|m| m["content"]
             .as_str()
             .is_some_and(|s| s.starts_with("Historical recap"))));
-    }
-
-    #[test]
-    fn compaction_summary_failure_uses_excerpts() {
-        let temp = TempDir::new().unwrap();
-        let server = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut cfg = config(&temp.0, format!("http://{}", server.local_addr().unwrap()));
-        cfg.local
-            .context_windows
-            .insert(cfg.local.model.clone(), 8192);
-        let fixture = thread::spawn(move || {
-            let (mut socket, _) = server.accept().unwrap();
-            let payload = receive(&mut socket);
-            assert!(payload["messages"].to_string().len().div_ceil(3) + 1536 < 8192);
-            respond(
-                &mut socket,
-                json!({"role":"assistant","content":"invalid summary"}),
-            );
-        });
-        let history = vec![
-            json!({"role":"user","content":"original"}),
-            json!({"role":"assistant","content":"\"\n".repeat(50_000)}),
-            json!({"role":"user","content":"follow-up"}),
-        ];
-        let events = std::cell::RefCell::new(Vec::new());
-        let projected = compaction::Compactor::default()
-            .prepare(
-                &cfg.local,
-                &history,
-                &[],
-                &AtomicBool::new(false),
-                &|event| events.borrow_mut().push(event),
-            )
-            .unwrap();
-        fixture.join().unwrap();
-        assert!(projected[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Excerpt:"));
-        assert!(events
-            .borrow()
-            .iter()
-            .any(|e| matches!(e, Event::Message { role, .. } if role == "Diagnostics")));
     }
 
     #[test]
