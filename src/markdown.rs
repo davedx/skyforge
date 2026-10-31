@@ -88,6 +88,18 @@ fn render(ui: &mut Ui, cache: &mut Cache, text: &str) {
 
 fn render_markdown(ui: &mut Ui, cache: &mut Cache, text: &str) {
     if !text.trim().is_empty() {
+        // A Markdown soft break is a space. Merge it into the text before
+        // rendering: separate space widgets after long tokens can make egui's
+        // wrapping row extend left of its origin and shift later messages.
+        let breaks: Vec<_> = Parser::new_ext(text, pulldown_cmark::Options::all())
+            .into_offset_iter()
+            .filter_map(|(event, range)| matches!(event, Event::SoftBreak).then_some(range))
+            .collect();
+        let mut normalized = Cow::Borrowed(text);
+        for range in breaks.into_iter().rev() {
+            normalized.to_mut().replace_range(range, " ");
+        }
+        let text = normalized.as_ref();
         let math_cache = cache.math.clone();
         let math = move |ui: &mut Ui, source: &str, inline| math_cache.show(ui, source, inline);
         CommonMarkViewer::new().render_math_fn(Some(&math)).show(
@@ -296,6 +308,50 @@ fn item_body(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn soft_breaks_after_long_json_values_keep_content_inside_left_edge() {
+        let ctx = egui::Context::default();
+        let mut cache = Cache::default();
+        let token = "0123456789abcdef".repeat(13);
+        for width in [360.0, 1000.0] {
+            for newline in ["\n", "\r\n"] {
+                let source = [
+                    "The migration failed:",
+                    "{",
+                    &format!("  \"instanceId\": \"{token}\""),
+                    "},",
+                    "\"logName\": \"projects/example/logs/stderr\",",
+                    "\"timestamp\": \"2026-10-22T12:37:44Z\"",
+                ]
+                .join(newline);
+                for _ in 0..3 {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 800.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let left = ui.max_rect().left();
+                                egui::ScrollArea::both().show(ui, |ui| {
+                                    egui::Frame::new().show(ui, |ui| {
+                                        show(ui, &mut cache, &source);
+                                        assert!(ui.min_rect().left() >= left);
+                                    });
+                                    let next = ui.label("The next message remains readable.");
+                                    assert!(next.rect.left() >= left);
+                                });
+                            });
+                        },
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn bare_urls_become_links_without_sentence_punctuation() {

@@ -904,6 +904,52 @@ pub fn find_codex() -> String {
     "codex".into()
 }
 
+pub fn claude_login_command(binary: &str) -> String {
+    format!("'{}' auth login", binary.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn open_claude_login(binary: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Terminal runs the CLI's own browser login, so Skyforge never handles tokens.
+    // A .command file avoids requiring Apple Events access to control Terminal.
+    let path = std::env::temp_dir().join(format!(
+        "skyforge-claude-login-{}.command",
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)?;
+        file.write_all(claude_login_script(binary).as_bytes())?;
+        let output = Command::new("/usr/bin/open")
+            .args(["-a", "Terminal"])
+            .arg(&path)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn claude_login_script(binary: &str) -> String {
+    format!(
+        "#!/bin/sh\nrm -- \"$0\"\ncd \"$HOME\" || exit 1\n{}\n",
+        claude_login_command(binary)
+    )
+}
+
 pub fn find_claude() -> String {
     let mut directories = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
@@ -923,6 +969,33 @@ pub fn find_claude() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_login_keeps_executable_paths_literal_and_removes_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data =
+            std::env::temp_dir().join(format!("skyforge-login-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&data).unwrap();
+        // Exercise spaces, quotes, substitutions and shell metacharacters.
+        let binary = data.join("claude ' \" $(touch injected) `touch injected` ; &");
+        std::fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher = data.join("login.command");
+        std::fs::write(&launcher, claude_login_script(binary.to_str().unwrap())).unwrap();
+        let output = Command::new("/bin/sh")
+            .arg(&launcher)
+            .env("HOME", &data)
+            .current_dir(&data)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "auth\nlogin\n");
+        assert!(!launcher.exists());
+        assert!(!data.join("injected").exists());
+        std::fs::remove_dir_all(data).unwrap();
+    }
 
     #[test]
     fn builder_cli_wake_tools_are_scoped_and_preserve_read_only_permissions() {

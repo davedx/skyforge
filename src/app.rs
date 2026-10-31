@@ -27,13 +27,18 @@ fn application_data_directory(base: &Path) -> PathBuf {
 #[derive(Default)]
 struct FileNode {
     path: PathBuf,
+    is_directory: bool,
     children: BTreeMap<String, FileNode>,
 }
 
 impl FileNode {
-    fn build(root: &Path, files: &[PathBuf]) -> Self {
+    fn build(root: &Path, files: &[PathBuf], directories: &[PathBuf]) -> Self {
         let mut tree = Self::default();
-        for path in files {
+        for (path, is_directory) in files
+            .iter()
+            .map(|p| (p, false))
+            .chain(directories.iter().map(|p| (p, true)))
+        {
             let Ok(relative) = path.strip_prefix(root) else {
                 continue;
             };
@@ -42,9 +47,11 @@ impl FileNode {
             for component in relative.components() {
                 let name = component.as_os_str().to_string_lossy().into_owned();
                 absolute.push(&name);
+                node.is_directory = true;
                 node = node.children.entry(name).or_default();
                 node.path = absolute.clone();
             }
+            node.is_directory |= is_directory;
         }
         tree
     }
@@ -65,6 +72,7 @@ pub struct Skyforge {
     wakes_open: bool,
     repository_watch: Option<crate::repository::RepositoryWatch>,
     files: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
     tree: FileNode,
     scanning: bool,
     file_query: String,
@@ -121,6 +129,7 @@ pub struct Skyforge {
 
 struct NewFile {
     directory: PathBuf,
+    is_directory: bool,
     name: String,
     error: Option<String>,
     focus: bool,
@@ -252,6 +261,7 @@ impl Skyforge {
             activities: HashMap::new(),
             run_agent_messages: HashMap::new(),
             files: vec![],
+            directories: vec![],
             tree: FileNode::default(),
             scanning: false,
             file_query: String::new(),
@@ -626,6 +636,7 @@ impl Skyforge {
         self.repository_find = RepositoryFind::default();
         self.pending_search_match = None;
         self.files.clear();
+        self.directories.clear();
         self.tree = FileNode::default();
         self.scanning = true;
         self.repository_watch = Some(crate::repository::RepositoryWatch::new(
@@ -683,10 +694,14 @@ impl Skyforge {
                     Err(error) => self.notice = Some(error),
                 }
             }
-            if self.files != snapshot.files {
-                self.tree =
-                    FileNode::build(Path::new(&self.tabs[self.active].project), &snapshot.files);
+            if self.files != snapshot.files || self.directories != snapshot.directories {
+                self.tree = FileNode::build(
+                    Path::new(&self.tabs[self.active].project),
+                    &snapshot.files,
+                    &snapshot.directories,
+                );
                 self.files = snapshot.files;
+                self.directories = snapshot.directories;
             }
             self.scanning = false;
             if let Some(error) = snapshot.error {
@@ -1424,7 +1439,11 @@ impl Skyforge {
             self.pending_search_match = None;
         }
         self.files.retain(|file| file != path);
-        self.tree = FileNode::build(Path::new(&self.tabs[self.active].project), &self.files);
+        self.tree = FileNode::build(
+            Path::new(&self.tabs[self.active].project),
+            &self.files,
+            &self.directories,
+        );
     }
 
     fn rename_file(&mut self, path: &Path, name: &str) -> Result<(), String> {
@@ -1471,7 +1490,7 @@ impl Skyforge {
         self.files.push(target);
         self.files.sort_unstable();
         self.files.dedup();
-        self.tree = FileNode::build(root, &self.files);
+        self.tree = FileNode::build(root, &self.files, &self.directories);
         if let Some(watch) = &self.repository_watch {
             watch.refresh();
         }
@@ -1479,9 +1498,22 @@ impl Skyforge {
     }
 
     fn create_file(&mut self, directory: &Path, name: &str) -> Result<(), String> {
+        self.create_repository_entry(directory, name, false)
+    }
+
+    fn create_directory(&mut self, directory: &Path, name: &str) -> Result<(), String> {
+        self.create_repository_entry(directory, name, true)
+    }
+
+    fn create_repository_entry(
+        &mut self,
+        directory: &Path,
+        name: &str,
+        is_directory: bool,
+    ) -> Result<(), String> {
         if name.trim().is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0'])
         {
-            return Err("Enter a filename without directory separators.".into());
+            return Err("Enter a name without directory separators.".into());
         }
         let root = Path::new(&self.tabs[self.active].project);
         let directory = directory.canonicalize().map_err(|e| e.to_string())?;
@@ -1489,26 +1521,38 @@ impl Skyforge {
             return Err("Choose a directory in the current repository.".into());
         }
         let path = directory.join(name);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    format!("{name} already exists. Choose another name.")
-                } else {
-                    format!("Cannot create {name}: {error}")
-                }
-            })?;
-        self.files.push(path.clone());
-        self.files.sort_unstable();
-        self.files.dedup();
-        self.tree = FileNode::build(root, &self.files);
+        let result = if is_directory {
+            std::fs::create_dir(&path)
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map(|_| ())
+        };
+        result.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{name} already exists. Choose another name.")
+            } else {
+                format!("Cannot create {name}: {error}")
+            }
+        })?;
+        let entries = if is_directory {
+            &mut self.directories
+        } else {
+            &mut self.files
+        };
+        entries.push(path.clone());
+        entries.sort_unstable();
+        entries.dedup();
+        self.tree = FileNode::build(root, &self.files, &self.directories);
         self.file_query.clear();
         if let Some(watch) = &self.repository_watch {
             watch.refresh();
         }
-        self.open_file(path);
+        if !is_directory {
+            self.open_file(path);
+        }
         Ok(())
     }
 
@@ -1800,13 +1844,9 @@ impl Skyforge {
         ui.horizontal(|ui| {
             ui.label(RichText::new("PROJECT FILES").size(15.0).color(MUTED))
                 .context_menu(|ui| new_file_menu(ui, &root, &mut create));
-            if ui
-                .small_button("+")
-                .on_hover_text("New file in project root")
-                .clicked()
-            {
-                create = Some(root.clone());
-            }
+            ui.menu_button("+", |ui| new_file_menu(ui, &root, &mut create))
+                .response
+                .on_hover_text("New file or directory in project root");
         });
         if self.scanning {
             ui.label(RichText::new("Reading repository…").color(MUTED));
@@ -1844,9 +1884,10 @@ impl Skyforge {
                     }
                 }
             });
-        if let Some(directory) = create {
+        if let Some((directory, is_directory)) = create {
             self.new_file = Some(NewFile {
                 directory,
+                is_directory,
                 name: String::new(),
                 error: None,
                 focus: true,
@@ -2815,12 +2856,13 @@ impl Skyforge {
             }
         };
         let mut open_builder = None;
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt(("conversation", &id))
             .stick_to_bottom(self.follow_tail)
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
+            .show_viewport(ui, |ui, viewport| {
+                // Wrap to the panel width while allowing wider content to scroll.
+                ui.set_width(viewport.width());
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 ui.spacing_mut().item_spacing.y = 4.0;
                 if self.messages.len() >= 100 && ui.small_button("Load earlier messages").clicked()
@@ -3288,6 +3330,20 @@ impl Skyforge {
                 ui.add_space(10.0);
                 ui.label("Claude Code executable");
                 ui.add(TextEdit::singleline(&mut self.config.claude_binary).desired_width(f32::INFINITY));
+                ui.horizontal(|ui| {
+                    #[cfg(target_os = "macos")]
+                    if ui.button("Sign in to Claude Code…").clicked() {
+                        match runner::open_claude_login(&self.config.claude_binary) {
+                            Ok(()) => self.notice = Some("Complete Claude Code sign-in in Terminal, then retry your message.".into()),
+                            Err(error) => self.notice = Some(format!("Could not open Claude Code sign-in: {error}. Use Copy login command and paste it into Terminal.")),
+                        }
+                    }
+                    if ui.button("Copy login command").clicked() {
+                        ctx.copy_text(runner::claude_login_command(&self.config.claude_binary));
+                        self.notice = Some("Paste the login command into your terminal, complete sign-in, then retry your message.".into());
+                    }
+                });
+                ui.label(RichText::new("Sign-in uses your configured Claude Code executable. If access errors persist, update Claude Code and check that your account includes Claude Code access.").color(MUTED));
                 ui.add_space(10.0);
                 ui.separator();
                 ui.label("OpenAI compatible model");
@@ -3377,33 +3433,47 @@ impl Skyforge {
             let mut open = true;
             let mut create = false;
             let mut cancel = false;
-            egui::Window::new("New file")
-                .id(egui::Id::new("new_repository_file"))
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label(format!("Create in {}", draft.directory.display()));
-                    let input = ui.add(TextEdit::singleline(&mut draft.name).hint_text("Filename"));
-                    if draft.focus {
-                        input.request_focus();
-                        draft.focus = false;
-                    }
-                    create = (input.has_focus() || input.lost_focus())
-                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-                    cancel =
-                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-                    if let Some(error) = &draft.error {
-                        ui.label(RichText::new(error).color(Color32::RED));
-                    }
-                    ui.horizontal(|ui| {
-                        create |= ui.button("Create").clicked();
-                        cancel |= ui.button("Cancel").clicked();
-                    });
+            egui::Window::new(if draft.is_directory {
+                "New directory"
+            } else {
+                "New file"
+            })
+            .id(egui::Id::new("new_repository_file"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Create in {}", draft.directory.display()));
+                let input = ui.add(TextEdit::singleline(&mut draft.name).hint_text(
+                    if draft.is_directory {
+                        "Directory name"
+                    } else {
+                        "Filename"
+                    },
+                ));
+                if draft.focus {
+                    input.request_focus();
+                    draft.focus = false;
+                }
+                create = (input.has_focus() || input.lost_focus())
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                cancel = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                if let Some(error) = &draft.error {
+                    ui.label(RichText::new(error).color(Color32::RED));
+                }
+                ui.horizontal(|ui| {
+                    create |= ui.button("Create").clicked();
+                    cancel |= ui.button("Cancel").clicked();
                 });
+            });
             if open && !cancel {
                 if create {
-                    if let Err(error) = self.create_file(&draft.directory, &draft.name) {
+                    let result = if draft.is_directory {
+                        self.create_directory(&draft.directory, &draft.name)
+                    } else {
+                        self.create_file(&draft.directory, &draft.name)
+                    };
+                    if let Err(error) = result {
                         draft.error = Some(error);
                         draft.focus = true;
                         self.new_file = Some(draft);
@@ -3692,9 +3762,9 @@ fn file_tree(
     open: &mut Option<PathBuf>,
     delete: &mut Option<PathBuf>,
     rename: &mut Option<PathBuf>,
-    create: &mut Option<PathBuf>,
+    create: &mut Option<(PathBuf, bool)>,
 ) {
-    for (name, node) in tree.children.iter().filter(|(_, n)| !n.children.is_empty()) {
+    for (name, node) in tree.children.iter().filter(|(_, n)| n.is_directory) {
         egui::CollapsingHeader::new(name)
             .id_salt(&node.path)
             .default_open(name == "docs" || name == "src")
@@ -3704,7 +3774,7 @@ fn file_tree(
             .header_response
             .context_menu(|ui| new_file_menu(ui, &node.path, create));
     }
-    for (name, node) in tree.children.iter().filter(|(_, n)| n.children.is_empty()) {
+    for (name, node) in tree.children.iter().filter(|(_, n)| !n.is_directory) {
         file_entry(
             ui,
             &node.path,
@@ -3744,9 +3814,13 @@ fn file_entry(
     });
 }
 
-fn new_file_menu(ui: &mut egui::Ui, directory: &Path, create: &mut Option<PathBuf>) {
+fn new_file_menu(ui: &mut egui::Ui, directory: &Path, create: &mut Option<(PathBuf, bool)>) {
     if ui.button("New file…").clicked() {
-        *create = Some(directory.to_path_buf());
+        *create = Some((directory.to_path_buf(), false));
+        ui.close_menu();
+    }
+    if ui.button("New directory…").clicked() {
+        *create = Some((directory.to_path_buf(), true));
         ui.close_menu();
     }
 }
@@ -5090,6 +5164,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
         };
         app.new_file = Some(NewFile {
             directory: project.clone(),
+            is_directory: false,
             name: String::new(),
             error: None,
             focus: true,
@@ -5108,6 +5183,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
 
         app.new_file = Some(NewFile {
             directory: project.clone(),
+            is_directory: false,
             name: "cancelled.txt".into(),
             error: None,
             focus: true,
@@ -5116,6 +5192,23 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
         frame(&mut app, vec![key(egui::Key::Escape)]);
         assert!(app.new_file.is_none());
         assert!(!project.join("cancelled.txt").exists());
+
+        app.new_file = Some(NewFile {
+            directory: project.clone(),
+            is_directory: true,
+            name: "new folder".into(),
+            error: None,
+            focus: true,
+        });
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![key(egui::Key::Enter)]);
+        assert!(app.new_file.is_none());
+        assert!(project.join("new folder").is_dir());
+        assert!(app.tree.children["new folder"].is_directory);
+        assert_eq!(
+            app.editor.as_ref().unwrap().path,
+            project.join("keyboard.txt")
+        );
 
         app.rename_file = Some(RenameFile {
             path: project.join("keyboard.txt"),
@@ -5148,7 +5241,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
     }
 
     #[test]
-    fn creating_repository_files_opens_editor_and_preserves_existing_files_and_edits() {
+    fn creating_repository_entries_preserves_existing_files_and_edits() {
         let data = std::env::temp_dir().join(format!("skyforge-create-{}", uuid::Uuid::new_v4()));
         let project = data.join("project");
         std::fs::create_dir_all(project.join("src")).unwrap();
@@ -5164,6 +5257,21 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
         assert!(app.show_editor);
         assert!(app.file_query.is_empty());
         assert!(app.tree.children.contains_key("first.txt"));
+
+        app.create_directory(&project, "empty folder").unwrap();
+        app.create_directory(&project.join("empty folder"), "nested")
+            .unwrap();
+        assert!(project.join("empty folder/nested").is_dir());
+        assert!(app.tree.children["empty folder"].is_directory);
+        assert!(app.tree.children["empty folder"].children["nested"].is_directory);
+        assert!(!app.files.contains(&project.join("empty folder")));
+        assert_eq!(app.editor.as_ref().unwrap().path, first);
+        assert!(app
+            .create_directory(&project, "empty folder")
+            .unwrap_err()
+            .contains("already exists"));
+        assert!(app.create_directory(&project, "first.txt").is_err());
+        assert!(app.create_file(&project, "empty folder").is_err());
 
         app.editor.as_mut().unwrap().text = "unsaved edits".into();
         app.create_file(&project.join("src"), "second.rs").unwrap();
@@ -5203,8 +5311,13 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
                 app.create_file(&project, name).is_err(),
                 "Accepted {name:?}"
             );
+            assert!(
+                app.create_directory(&project, name).is_err(),
+                "Accepted directory {name:?}"
+            );
         }
         assert!(app.create_file(&data, "outside.txt").is_err());
+        assert!(app.create_directory(&data, "outside-directory").is_err());
         assert!(!data.join("outside.txt").exists());
         assert!(app
             .create_file(&project.join("missing"), "file.txt")
@@ -5304,7 +5417,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
         let ctx = egui::Context::default();
         let mut app = Skyforge::load(&ctx, Some(project.clone()), data.join("state")).unwrap();
         app.files = vec![current.clone(), other.clone()];
-        app.tree = FileNode::build(&project, &app.files);
+        app.tree = FileNode::build(&project, &app.files, &app.directories);
         app.open_file(current.clone());
         app.editor.as_mut().unwrap().text = "unsaved edits".into();
 

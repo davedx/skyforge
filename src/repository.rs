@@ -19,6 +19,7 @@ const MAX_DELAY: Duration = Duration::from_millis(500);
 
 pub struct Snapshot {
     pub files: Vec<PathBuf>,
+    pub directories: Vec<PathBuf>,
     pub error: Option<String>,
 }
 
@@ -141,6 +142,7 @@ fn run(
         #[cfg(not(target_os = "macos"))]
         let mut directories = HashSet::new();
         let mut files = Vec::new();
+        let mut visible_directories = Vec::new();
         for entry in ignore::WalkBuilder::new(&root)
             .hidden(false)
             .max_depth(Some(25))
@@ -157,6 +159,9 @@ fn run(
                 return;
             }
             if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                if entry.path() != root {
+                    visible_directories.push(entry.path().to_owned());
+                }
                 #[cfg(not(target_os = "macos"))]
                 {
                     let directory = entry.path().to_owned();
@@ -199,8 +204,10 @@ fn run(
             }
         }
         files.sort_unstable();
+        visible_directories.sort_unstable();
         *latest.lock().unwrap() = Some(Snapshot {
             files,
+            directories: visible_directories,
             error: error.take(),
         });
         ctx.request_repaint();
@@ -313,6 +320,34 @@ mod tests {
         wait_for(&watch, &["lib/nested/later.txt", "lib/nested/new.txt"]);
         std::fs::remove_dir_all(project.join("lib")).unwrap();
         wait_for(&watch, &[]);
+    }
+
+    #[test]
+    fn refresh_keeps_empty_directories_separate_from_files() {
+        let temp = Temp::new();
+        std::fs::create_dir_all(temp.0.join("empty/nested")).unwrap();
+        std::fs::write(temp.0.join("file.txt"), "contents").unwrap();
+        let watch = RepositoryWatch::new(temp.0.clone(), egui::Context::default());
+        for _ in 0..2 {
+            watch.refresh();
+            let began = Instant::now();
+            let snapshot = loop {
+                if let Some(snapshot) = watch.take() {
+                    break snapshot;
+                }
+                assert!(
+                    began.elapsed() < Duration::from_secs(10),
+                    "Scanner did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+            assert_eq!(snapshot.files, vec![temp.0.join("file.txt")]);
+            assert_eq!(
+                snapshot.directories,
+                vec![temp.0.join("empty"), temp.0.join("empty/nested")]
+            );
+        }
     }
 
     #[test]
