@@ -20,7 +20,7 @@ An initial **native Rust prototype** is now implemented with egui/eframe, SQLite
 Build a double-clickable macOS app with `sh scripts/bundle-macos.sh`.
 The root `icon.png` supplies the window icon and the generated macOS bundle icon.
 
-For release downloads, run `sh scripts/package-macos.sh`; the app ZIP, standalone executable, and checksums are written to `target/dist/`. To publish a release, set the version in `Cargo.toml` (and update `Cargo.lock` with `cargo check`), commit and push, then push a matching tag such as `v0.1.0`. GitHub Actions tests, builds, and publishes the Apple Silicon downloads automatically.
+Every push to `main` automatically tests, builds, and publishes a new Apple Silicon release. Releases use unique tags such as `build-2-abc1234`; no version bump or manual tag is needed. The latest-release download link points to the newest successful build. To package locally, run `sh scripts/package-macos.sh`; the app ZIP, standalone executable, and checksums are written to `target/dist/`.
 
 **Builder** handles coding and creation. **Thinker** provides a conversational
 Chatbot profile with projects, read-only tools, and shared/project memories in

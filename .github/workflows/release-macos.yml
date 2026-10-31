@@ -2,15 +2,11 @@ name: Release macOS
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
 
 permissions:
   contents: read
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   release:
@@ -25,13 +21,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify architecture and release version
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Prepare release
+        id: release
         run: |
           test "$(uname -m)" = arm64
           version=$(awk -F '"' '/^version = / {print $2; exit}' Cargo.toml)
-          test "$RELEASE_TAG" = "v$version"
+          echo "tag=build-$GITHUB_RUN_NUMBER-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "title=Skyforge $version · build $GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
       - name: Install Rust
         run: rustup update stable --no-self-update
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -49,11 +45,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
         run: |
-          gh release create "$RELEASE_TAG" \
+          if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" --notes-file docs/macos-release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" \
             target/dist/Skyforge-macos-arm64.zip \
             target/dist/skyforge-macos-arm64 \
-            target/dist/SHA256SUMS \
-            --verify-tag --title "Skyforge $RELEASE_TAG" \
-            --notes-file docs/macos-release-notes.md
+            target/dist/SHA256SUMS --clobber
+          # A slower older build must not replace a newer successful release.
+          latest=true
+          published_tag=$(gh release view --json tagName --jq .tagName 2>/dev/null || true)
+          if [[ "$published_tag" =~ ^build-([0-9]+)- ]] && (( BASH_REMATCH[1] > GITHUB_RUN_NUMBER )); then
+            latest=false
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest="$latest"
