@@ -1,0 +1,59 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify architecture and release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test "$(uname -m)" = arm64
+          version=$(awk -F '"' '/^version = / {print $2; exit}' Cargo.toml)
+          test "$RELEASE_TAG" = "v$version"
+      - name: Install Rust
+        run: rustup update stable --no-self-update
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Test
+        run: cargo test --locked
+      - name: Package app and executable
+        run: sh scripts/package-macos.sh
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            target/dist/Skyforge-macos-arm64.zip \
+            target/dist/skyforge-macos-arm64 \
+            target/dist/SHA256SUMS \
+            --verify-tag --title "Skyforge $RELEASE_TAG" \
+            --notes-file docs/macos-release-notes.md

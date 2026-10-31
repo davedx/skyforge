@@ -4,6 +4,8 @@ A lightweight desktop GUI for working with coding agents, browsing a repository,
 
 The motivation is frustration with bugs, restricted prompt editing, poor workstream discovery, and excessive resource use in the Codex and Claude Code VS Code extensions.
 
+On an Apple Silicon Mac, download **Skyforge-macos-arm64.zip** from the [latest GitHub release](https://github.com/davedx/skyforge/releases/latest), unzip it, and drag **Skyforge.app** into **Applications**. No Rust or Xcode installation is needed. Requires macOS 11 or later. The app is ad-hoc signed; if macOS blocks it, approve it in **System Settings → Privacy & Security → Open Anyway** after trying to open it. Install and sign in to your chosen agent CLI separately, or use an OpenAI-compatible server.
+
 Requirements are split into two stages:
 
 - [First release](docs/requirements.md): the table-stakes experience to build first.
@@ -17,6 +19,8 @@ An initial **native Rust prototype** is now implemented with egui/eframe, SQLite
 
 Build a double-clickable macOS app with `sh scripts/bundle-macos.sh`.
 The root `icon.png` supplies the window icon and the generated macOS bundle icon.
+
+For release downloads, run `sh scripts/package-macos.sh`; the app ZIP, standalone executable, and checksums are written to `target/dist/`. To publish a release, set the version in `Cargo.toml` (and update `Cargo.lock` with `cargo check`), commit and push, then push a matching tag such as `v0.1.0`. GitHub Actions tests, builds, and publishes the Apple Silicon downloads automatically.
 
 **Builder** handles coding and creation. **Thinker** provides a conversational
 Chatbot profile with projects, read-only tools, and shared/project memories in

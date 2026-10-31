@@ -33,7 +33,8 @@ for task_icon_size in 16 32 128 256 512; do
 done
 iconutil -c icns "$task_iconset" --output "$task_bundle/Contents/Resources/Skyforge.icns"
 
-cat > "$task_bundle/Contents/Info.plist" <<'PLIST'
+task_version=$(awk -F '"' '/^version = / {print $2; exit}' Cargo.toml)
+cat > "$task_bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -42,8 +43,9 @@ cat > "$task_bundle/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>skyforge</string>
   <key>CFBundleIconFile</key><string>Skyforge.icns</string>
   <key>CFBundleIdentifier</key><string>dev.skyforge.prototype</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>$task_version</string>
+  <key>CFBundleShortVersionString</key><string>$task_version</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
