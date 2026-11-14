@@ -12,10 +12,10 @@ const REFRESH: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Window {
-    used_percent: f64,
-    window_duration_mins: Option<i64>,
-    resets_at: Option<i64>,
+pub(crate) struct Window {
+    pub(crate) used_percent: f64,
+    pub(crate) window_duration_mins: Option<i64>,
+    pub(crate) resets_at: Option<i64>,
 }
 
 impl Window {
@@ -48,9 +48,9 @@ impl Window {
 }
 
 #[derive(Debug, Deserialize)]
-struct Limits {
-    primary: Option<Window>,
-    secondary: Option<Window>,
+pub(crate) struct Limits {
+    pub(crate) primary: Option<Window>,
+    pub(crate) secondary: Option<Window>,
 }
 
 impl Limits {
@@ -153,6 +153,7 @@ fn read_limits(binary: &str, timeout: Duration) -> Result<Limits, String> {
 
 #[derive(Default)]
 pub struct Usage {
+    claude: bool,
     binary: String,
     pending: Option<Receiver<Result<Limits, String>>>,
     limits: Option<Limits>,
@@ -162,6 +163,21 @@ pub struct Usage {
 }
 
 impl Usage {
+    pub fn claude() -> Self {
+        Self {
+            claude: true,
+            ..Default::default()
+        }
+    }
+
+    fn refresh_interval(&self) -> Duration {
+        if self.claude {
+            Duration::from_secs(300)
+        } else {
+            REFRESH
+        }
+    }
+
     #[cfg(test)]
     pub fn fixture() -> Self {
         Self {
@@ -179,13 +195,14 @@ impl Usage {
     pub fn update(&mut self, ctx: &egui::Context, binary: &str, visible: bool) {
         if self.binary != binary {
             *self = Self {
+                claude: self.claude,
                 binary: binary.into(),
                 ..Default::default()
             };
         }
         if let Some(result) = self.pending.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.pending = None;
-            self.due = Some(Instant::now() + REFRESH);
+            self.due = Some(Instant::now() + self.refresh_interval());
             match result {
                 Ok(limits) => {
                     self.limits = Some(limits);
@@ -203,8 +220,13 @@ impl Usage {
             self.pending = Some(rx);
             let binary = binary.to_owned();
             let ctx = ctx.clone();
+            let claude = self.claude;
             std::thread::spawn(move || {
-                let _ = tx.send(read_limits(&binary, Duration::from_secs(15)));
+                let _ = tx.send(if claude {
+                    crate::claude_usage::read_limits()
+                } else {
+                    read_limits(&binary, Duration::from_secs(15))
+                });
                 ctx.request_repaint();
             });
         }
@@ -212,14 +234,20 @@ impl Usage {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        let mut detail = "Codex account usage limits (shared across workstreams).\nRemaining quota percentages, not a token count.\n".to_owned();
+        let provider = if self.claude { "Claude" } else { "Codex" };
+        let interval = if self.claude {
+            "five minutes"
+        } else {
+            "minute"
+        };
+        let mut detail = format!("{provider} account usage limits (shared across workstreams).\nRemaining quota percentages, not a token count.\n");
         let label = if let Some(limits) = &self.limits {
             for window in limits.windows() {
                 detail.push_str(&format!("\n{}", window.detail()));
             }
             if let Some(updated) = self.updated {
                 detail.push_str(&format!(
-                    "\nUpdated {}. Refreshes every minute. Click to refresh.",
+                    "\nUpdated {}. Refreshes every {interval}. Click to refresh.",
                     updated.format("%H:%M:%S")
                 ));
             }

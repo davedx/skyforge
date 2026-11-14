@@ -58,6 +58,8 @@ impl FileNode {
 }
 
 pub struct Skyforge {
+    secops_open: bool,
+    secops: crate::secops::SecOps,
     store: Store,
     tabs: Vec<Workstream>,
     active: usize,
@@ -100,6 +102,7 @@ pub struct Skyforge {
     config: AgentConfig,
     model_choices: Vec<(String, String)>,
     codex_usage: crate::codex_usage::Usage,
+    claude_usage: crate::codex_usage::Usage,
     model_discovery: Option<Receiver<Result<crate::local::ModelCatalog, String>>>,
     model_discovery_due: Option<Instant>,
     model_discovery_status: String,
@@ -245,7 +248,13 @@ impl Skyforge {
         let projects = store.projects().map_err(|e| e.to_string())?;
         let browse_project = tabs[active].thinker_project.clone();
         let wakes = store.wakes(None).map_err(|e| e.to_string())?;
+        let secops = store
+            .setting("secops_draft")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
         let mut app = Self {
+            secops_open: false,
+            secops,
             store,
             tabs,
             active,
@@ -288,6 +297,7 @@ impl Skyforge {
             settings_open: false,
             model_choices,
             codex_usage: Default::default(),
+            claude_usage: crate::codex_usage::Usage::claude(),
             model_discovery: None,
             model_discovery_due: None,
             model_discovery_status: String::new(),
@@ -441,6 +451,7 @@ impl Skyforge {
     }
 
     fn switch_mode(&mut self, mode: Mode, ctx: &egui::Context) {
+        self.secops_open = false;
         if self.tabs[self.active].mode == mode {
             return;
         }
@@ -1611,7 +1622,9 @@ impl Skyforge {
                     ui.label(RichText::new("/ ").color(MUTED));
                     let thinker = self.tabs[self.active].mode == Mode::Thinker;
                     let project = Path::new(&self.tabs[self.active].project);
-                    if thinker {
+                    if self.secops_open {
+                        ui.label(RichText::new("SecOps").strong());
+                    } else if thinker {
                         let name = self
                             .projects
                             .iter()
@@ -1685,10 +1698,14 @@ impl Skyforge {
                         if ui.button("Settings").clicked() {
                             self.settings_open = true;
                         }
-                        if ui.selectable_label(thinker, "Thinker").clicked() {
+                        if ui.selectable_label(self.secops_open, "SecOps").clicked() {
+                            self.save_active();
+                            self.secops_open = true;
+                        }
+                        if ui.selectable_label(!self.secops_open && thinker, "Thinker").clicked() {
                             self.switch_mode(Mode::Thinker, ctx);
                         }
-                        if ui.selectable_label(!thinker, "Builder").clicked() {
+                        if ui.selectable_label(!self.secops_open && !thinker, "Builder").clicked() {
                             self.switch_mode(Mode::Builder, ctx);
                         }
                     });
@@ -1723,7 +1740,7 @@ impl Skyforge {
                     {
                         self.wakes_open = true;
                     }
-                    let running = self.runs.len();
+                    let running = self.runs.len() + usize::from(self.secops.running());
                     ui.label(
                         RichText::new(if self.restart.requested {
                             format!("Restart queued · waiting for {running} run(s)")
@@ -1739,13 +1756,20 @@ impl Skyforge {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new("Enter send · Shift+Enter new line")
-                                .size(16.0)
-                                .color(MUTED),
+                            RichText::new(if self.secops_open {
+                                "SecOps · request setup"
+                            } else {
+                                "Enter send · Shift+Enter new line"
+                            })
+                            .size(16.0)
+                            .color(MUTED),
                         );
                     });
                 });
             });
+        if self.secops_open {
+            return;
+        }
         egui::TopBottomPanel::top("workstream_tabs")
             .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ctx, |ui| {
@@ -2801,6 +2825,8 @@ impl Skyforge {
                 self.tabs[self.active].model = selection;
                 if runner::provider(&self.tabs[self.active].model) == "codex" {
                     self.codex_usage.show(ui);
+                } else if runner::provider(&self.tabs[self.active].model) == "claude" {
+                    self.claude_usage.show(ui);
                 }
                 if previous != self.tabs[self.active].model {
                     if thinker {
@@ -3087,6 +3113,7 @@ impl Skyforge {
     fn advance_restart(&mut self, ctx: &egui::Context) {
         if !self.restart.requested
             || !self.runs.is_empty()
+            || self.secops.running()
             || self.restart_decision
             || self.allow_quit
         {
@@ -3101,7 +3128,7 @@ impl Skyforge {
 
     fn commit_restart(&mut self, ctx: &egui::Context) {
         // A new run may have started while the unsaved-file dialog was open.
-        if !self.runs.is_empty() {
+        if !self.runs.is_empty() || self.secops.running() {
             self.restart_decision = false;
             return;
         }
@@ -3587,10 +3614,19 @@ impl Skyforge {
 
 impl eframe::App for Skyforge {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.secops.poll();
+        if self.secops.running() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         self.codex_usage.update(
             ctx,
             &self.config.binary,
             runner::provider(&self.tabs[self.active].model) == "codex",
+        );
+        self.claude_usage.update(
+            ctx,
+            &self.config.claude_binary,
+            runner::provider(&self.tabs[self.active].model) == "claude",
         );
         if let Some(due) = self.model_discovery_due {
             if Instant::now() >= due {
@@ -3665,20 +3701,26 @@ impl eframe::App for Skyforge {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.quit_decision = true;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+        if !self.secops_open
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N))
+        {
             self.new_conversation(ctx);
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+        if !self.secops_open
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K))
+        {
             self.history = true;
             self.history_dirty = true;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
-            if self.tabs[self.active].mode == Mode::Builder {
+            if !self.secops_open && self.tabs[self.active].mode == Mode::Builder {
                 self.save_file();
             }
             self.save_active();
         }
-        self.file_find_shortcut(ctx);
+        if !self.secops_open {
+            self.file_find_shortcut(ctx);
+        }
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -3686,19 +3728,33 @@ impl eframe::App for Skyforge {
                 .filter_map(|f| f.path.clone())
                 .collect::<Vec<_>>()
         });
-        if !dropped.is_empty() {
+        if !self.secops_open && !dropped.is_empty() {
             self.attach(dropped, ctx);
         }
         self.toolbar(ctx);
-        self.sidebar(ctx);
-        self.editor_ui(ctx);
-        self.workspace(ctx);
+        if self.secops_open {
+            if self.secops.show(ctx) {
+                match serde_json::to_string(&self.secops) {
+                    Ok(draft) => {
+                        if let Err(error) = self.store.set_setting("secops_draft", &draft) {
+                            self.notice = Some(format!("Could not save SecOps draft: {error}"));
+                        }
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
+        } else {
+            self.sidebar(ctx);
+            self.editor_ui(ctx);
+            self.workspace(ctx);
+        }
         self.dialogs(ctx);
         self.advance_restart(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.allow_quit = true; // Draining events must never dispatch timers during shutdown.
+        self.secops.shutdown();
         self.delegation_host.shutdown();
         while self.delegation_host.try_recv().is_ok() {}
         self.save_active();
@@ -6165,6 +6221,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
         let ctx = egui::Context::default();
         let mut app = Skyforge::load(&ctx, Some(std::env::temp_dir()), data.clone()).unwrap();
         app.codex_usage = crate::codex_usage::Usage::fixture();
+        app.claude_usage = crate::codex_usage::Usage::fixture();
         for (model, model_label) in [
             ("claude:sonnet", "Anthropic Claude · Sonnet"),
             ("", "Codex · Default model"),
@@ -6219,7 +6276,7 @@ printf '%s\n' '{"type":"item.completed","item":{"id":"final","type":"agent_messa
                         "{label} hover must fit inside the panel: {rect:?} in {panel:?}"
                     );
                 }
-                if model.is_empty() {
+                {
                     let usage = output
                         .shapes
                         .iter()

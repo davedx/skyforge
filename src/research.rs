@@ -1,11 +1,18 @@
 use regex_automata::meta::Regex;
 use serde_json::{json, Value};
-use std::{process::Command, sync::atomic::AtomicBool, time::Duration};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+#[cfg(test)]
 use url::Url;
+
+const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
+const EXA_RESULTS_LIMIT: usize = 1_100_000;
 
 pub fn definitions() -> Vec<Value> {
     vec![
-        json!({"type":"function","function":{"name":"web_search","description":"Search the web for sources. Returns titles, source URLs and snippets. Open useful sources with fetch_url before relying on them, and cite their URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":"web_search","description":"Search the web for sources. Returns up to about eight numbered source results, each with its title, URL and a short snippet drawn from the page. Open useful sources with fetch_url before relying on them, and cite their URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"fetch_url","description":"Read an HTTP(S) source page without executing scripts or changing files. Returns its URL and readable text; some sites require a browser and cannot be read.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":false}}}),
     ]
 }
@@ -20,10 +27,7 @@ pub fn tool(name: &str, args: &Value, stop: &AtomicBool) -> Result<String, Strin
             if query.chars().count() > 1000 {
                 return Err("Search query is too long".into());
             }
-            let mut url = Url::parse("https://html.duckduckgo.com/html/").unwrap();
-            url.query_pairs_mut().append_pair("q", query);
-            let page = get(url.as_str(), stop)?;
-            search_results(&page.body)
+            call_exa_mcp_search(query, stop)
         }
         "fetch_url" => {
             let url = args["url"].as_str().ok_or("Missing source URL")?;
@@ -61,8 +65,147 @@ struct Page {
     body: String,
 }
 
-fn source_url(input: &str) -> Result<Url, String> {
-    let url = Url::parse(input).map_err(|_| "Invalid source URL")?;
+fn call_exa_mcp_search(query: &str, stop: &AtomicBool) -> Result<String, String> {
+    let mut command = Command::new("/usr/bin/curl");
+    // Disable curl's user configuration. The harness, not the model, decides this is a search,
+    // so the model supplies neither a command nor request body.
+    command.args([
+        "-q",
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--location",
+        "--max-redirs",
+        "5",
+        "--proto",
+        "=http,https",
+        "--proto-redir",
+        "=http,https",
+        "--connect-timeout",
+        "8",
+        "--max-time",
+        "25",
+        "--http1.1",
+        "--user-agent",
+        "Skyforge/0.1 (read-only research)",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        "Accept: application/json, text/event-stream",
+        "-d",
+    ]);
+    command
+        .arg(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "web_search_advanced_exa",
+                    "arguments": {
+                        "query": query,
+                        "type": "auto",
+                        "numResults": 8,
+                        "highlights": true,
+                        "textMaxCharacters": 3000
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .arg("--")
+        .arg(EXA_MCP_URL);
+    let (success, bytes, error) = crate::local::execute(
+        command,
+        None,
+        stop,
+        Duration::from_secs(28),
+        EXA_RESULTS_LIMIT,
+    )?;
+    if !success {
+        return Err(format!(
+            "Web search is unavailable: {}",
+            crate::runner::clip(&String::from_utf8_lossy(&error), 1000)
+        ));
+    }
+    let body = String::from_utf8(bytes)
+        .map_err(|_| "Web search returned no UTF-8 text. The search service may be blocking automated requests.".to_string())?;
+    parse_exa_mcp_results(&body)
+}
+
+fn parse_exa_mcp_results(body: &str) -> Result<String, String> {
+    // The endpoint answers with a Model Context Protocol event stream, so the JSON payload is the
+    // last "data:" line of the stream. Parse it, then fall back to the text payload Exa exposes by
+    // default through the basic tool when the advanced tool is not offered by this deployment.
+    let payload = match body
+        .rsplit_once("data:")
+        .and_then(|(_, payload)| payload.strip_prefix(' '))
+    {
+        Some(payload) => payload,
+        None => body,
+    };
+    let parsed: Value = serde_json::from_str(payload)
+        .map_err(|e| format!("Web search returned an unreadable response: {e}"))?;
+    if let Some(status) = parsed.pointer("/error/code").and_then(|v| v.as_i64()) {
+        let detail = parsed
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Ok(
+            json!({"message":format!("Web search failed: status {status} — {detail}")}).to_string(),
+        );
+    }
+    let content = parsed
+        .pointer("/result/content")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| {
+            "Web search returned no results. The search service may be blocking automated requests."
+                .to_string()
+        })?;
+    let payload_text = content
+        .iter()
+        .find(|c| c.get("type") == Some(&json!("text")))
+        .and_then(|c| c["text"].as_str())
+        .ok_or_else(|| "Web search returned no readable results. The search service may be blocking automated requests.".to_string())?;
+    let payload_value =
+        serde_json::from_str::<Value>(payload_text).unwrap_or_else(|_| parsed.clone());
+    let results = payload_value
+        .pointer("/results")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            "Web search returned no results. The search service may be blocking automated requests."
+                .to_string()
+        })?;
+    let mut sources = Vec::new();
+    for entry in results.iter() {
+        if sources.len() == 8 {
+            break;
+        }
+        let url = match entry["url"].as_str() {
+            Some(url) => url,
+            None => continue,
+        };
+        let title = entry["title"].as_str().unwrap_or_default().trim();
+        let snapshot = entry["text"].as_str().unwrap_or_default();
+        let snippet = snapshot
+            .split_whitespace()
+            .take(60)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !title.is_empty() || !snippet.is_empty() {
+            sources.push(json!({"url":url,"title":title,"snippet":snippet}));
+        }
+    }
+    if sources.is_empty() {
+        return Ok(
+            json!({"message":"Web search returned no usable results for this query."}).to_string(),
+        );
+    }
+    Ok(json!({"sources":sources}).to_string())
+}
+
+fn source_url(input: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(input).map_err(|_| "Invalid source URL".to_string())?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -124,6 +267,7 @@ fn get(input: &str, stop: &AtomicBool) -> Result<Page, String> {
     })
 }
 
+#[cfg(test)]
 fn search_results(html: &str) -> Result<String, String> {
     let anchors = Regex::new(r#"(?is)<a\b([^>]*)>(.*?)</a>"#).unwrap();
     let href = Regex::new(r#"(?is)\bhref\s*=\s*["']([^"']+)["']"#).unwrap();

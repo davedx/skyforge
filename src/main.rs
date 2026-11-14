@@ -1,4 +1,5 @@
 mod app;
+mod claude_usage;
 mod codex_usage;
 mod delegation;
 mod delegation_ipc;
@@ -12,6 +13,7 @@ mod repository_search;
 mod research;
 mod restart;
 mod runner;
+mod secops;
 mod store;
 mod theme;
 mod thinker;

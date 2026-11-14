@@ -147,6 +147,10 @@ impl Config {
                 == Some("api.deepseek.com")
     }
 
+    fn is_ornith(&self) -> bool {
+        self.model.to_lowercase().contains("ornith")
+    }
+
     pub fn replay_key(&self) -> String {
         self.model_key(&self.model)
     }
@@ -598,6 +602,10 @@ fn run_inner(
         if config.search {
             definitions.extend(crate::research::definitions());
         }
+    } else if config.search && config.local.is_ornith() {
+        // Codex/Claude/DeepSeek have server-side web search; local Ollama models like
+        // ornith do not, so offer the harness web_search/fetch_url tools even in Builder mode.
+        definitions.extend(crate::research::definitions());
     }
     for step in 0..64 {
         if stop.load(Ordering::SeqCst) {
@@ -737,7 +745,7 @@ fn run_inner(
                         &args,
                     );
                 }
-                if w.mode == crate::store::Mode::Thinker
+                if (w.mode == crate::store::Mode::Thinker || config.local.is_ornith())
                     && config.search
                     && matches!(name, "web_search" | "fetch_url")
                 {
